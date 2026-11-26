@@ -71,8 +71,8 @@ class JobManager:
     async def stop(self) -> None:
         self.stopping = True
         active = list(self.tasks.values())
-        for task in active:
-            task.cancel()
+        for job_id in list(self.tasks):
+            self.store.request_stop(job_id)
         if active:
             await asyncio.gather(*active, return_exceptions=True)
         if self.cleanup_task:
@@ -102,16 +102,20 @@ class JobManager:
         self.tasks[job_id] = task
         task.add_done_callback(lambda _: self.tasks.pop(job_id, None))
 
-    def submit(self, keyword: str, province: str, count: int, idempotency_key: str | None = None) -> tuple[dict, bool]:
+    def submit(self, keyword: str, province: str, count: int | None, idempotency_key: str | None = None) -> tuple[dict, bool]:
         self.store.cleanup_expired()
         job_id = uuid.uuid4().hex
         state = {
             "schema_version": 2,
+            "job_model_version": 3,
             "job_id": job_id,
             "status": "queued",
             "keyword": keyword,
             "province": province,
             "requested_count": count,
+            "mode": "limited" if count is not None else "unlimited",
+            "stop_requested": False,
+            "active_urls": [],
             "current_round": 0,
             "total_rounds": self.max_rounds,
             "round_url_target": 0,
@@ -156,6 +160,9 @@ class JobManager:
             "updated_at": record["updated_at"],
             "last_event_id": record["last_event_id"],
             "requested_count": state["requested_count"],
+            "mode": state.get("mode", "limited"),
+            "stop_requested": state.get("stop_requested", False),
+            "active_url_count": len(state.get("active_urls", [])),
             "current_round": state["current_round"],
             "total_rounds": state["total_rounds"],
             "discovered_page_count": state["discovered_page_count"],
@@ -186,6 +193,8 @@ class JobManager:
             "job_id": status["job_id"],
             "status": status["status"],
             "requested_count": status["requested_count"],
+            "mode": status["mode"],
+            "stop_requested": status["stop_requested"],
             "successful_results": status["successful_results"],
             "total_unique_mobile_numbers": status["total_unique_mobile_numbers"],
             "discovered_page_count": status["discovered_page_count"],
@@ -208,6 +217,9 @@ class JobManager:
                 state = record["state"]
                 if record["status"] in TERMINAL:
                     return
+                if state.get("stop_requested") and not state.get("active_urls"):
+                    self._finish(job_id, "stopped")
+                    return
                 stage = state["current_stage"]
 
                 if stage == "preparing" and state.get("resume_stage"):
@@ -222,12 +234,15 @@ class JobManager:
                     continue
                 if stage == "round_completed":
                     if (
-                        len(state["results"]) >= state["requested_count"]
+                        (state.get("mode", "limited") == "limited" and len(state["results"]) >= state["requested_count"])
                         or state["stop_after_round"]
                         or state["current_round"] >= self.max_rounds
                     ):
                         status = "failed" if state["fail_after_round"] and not state["results"] else "completed"
                         self._finish(job_id, status)
+                        return
+                    if state.get("stop_requested"):
+                        self._finish(job_id, "stopped")
                         return
                     self._begin_round(job_id, state["current_round"] + 1)
                     continue
@@ -256,11 +271,11 @@ class JobManager:
 
     def _begin_round(self, job_id: str, round_number: int) -> None:
         state = self.store.get(job_id)["state"]
-        remaining = max(0, state["requested_count"] - len(state["results"]))
+        remaining = max(0, state["requested_count"] - len(state["results"])) if state.get("mode", "limited") == "limited" else None
         query = self.query_fn(state["keyword"], state["province"], round_number)
         state.update({
             "current_round": round_number,
-            "round_url_target": math.ceil(remaining * self.url_factor),
+            "round_url_target": math.ceil(remaining * self.url_factor) if remaining is not None else None,
             "discovered_in_round": 0,
             "processed_in_round": 0,
             "remaining_in_round": 0,
@@ -297,13 +312,13 @@ class JobManager:
             current_pages = current["round_pages"]
             seen = {page["url"] for page in current_pages}
             processed = set(current["processed_urls"])
-            slots = max(0, current["round_url_target"] - len(current_pages))
+            slots = max(0, current["round_url_target"] - len(current_pages)) if current["round_url_target"] is not None else None
             added = 0
             for page in new_pages:
                 page_url = str(page.get("url", ""))
                 if not page_url or page_url in seen or page_url in processed:
                     continue
-                if added >= slots:
+                if slots is not None and added >= slots:
                     break
                 seen.add(page_url)
                 current_pages.append(page)
@@ -366,22 +381,22 @@ class JobManager:
         statuses = state["page_statuses"]
         pending = [page for page in round_pages if statuses.get(page["url"], {}).get("status") == "pending"]
         if not pending:
+            if state.get("stop_requested"):
+                self._finish(job_id, "stopped")
+                return
             self._complete_round(job_id)
             return
 
         for offset in range(0, len(pending), self.max_concurrent_sites):
+            state = self.store.get(job_id)["state"]
+            if state.get("stop_requested"):
+                break
+            if state.get("mode", "limited") == "limited" and len(state["results"]) >= state["requested_count"]:
+                break
             batch = pending[offset : offset + self.max_concurrent_sites]
-            for page in batch:
-                state = self.store.get(job_id)["state"]
-                page_url = page["url"]
-                status = state["page_statuses"].setdefault(page_url, {})
-                status.update({"status": "processing", "round": state["current_round"], "error": None})
-                if page_url not in state["processed_urls"]:
-                    state["processed_urls"].append(page_url)
-                self._update_round_counts(state)
-                self.store.save(job_id, state, event=("page_started", {
-                    "page_url": page_url, "website_url": page.get("website_url"), **self._summary(state),
-                }))
+            started = [page for page in batch if self.store.start_url(job_id, page)]
+            if not started:
+                break
 
             async def process_one(page: dict) -> tuple[dict, dict]:
                 try:
@@ -392,34 +407,29 @@ class JobManager:
                 except Exception as exc:
                     return page, {"page_url": page["url"], "pages": [], "error": str(exc)[:500]}
 
-            tasks = [asyncio.create_task(process_one(page)) for page in batch]
-            target_reached = False
+            tasks = [asyncio.create_task(process_one(page)) for page in started]
             for completed in asyncio.as_completed(tasks):
                 page, page_result = await completed
-                target_reached = self._record_page(job_id, page, page_result)
-                if target_reached:
-                    break
-
-            if target_reached:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                self._skip_remaining_round_pages(job_id)
-                break
+                self._record_page(job_id, page, page_result)
+        state = self.store.get(job_id)["state"]
+        if state.get("stop_requested"):
+            self._skip_remaining_round_pages(job_id, "stop_requested")
+            self._finish(job_id, "stopped")
+            return
+        if state.get("mode", "limited") == "limited" and len(state["results"]) >= state["requested_count"]:
+            self._skip_remaining_round_pages(job_id, "requested_result_count_reached")
+            return
         self._complete_round(job_id)
 
     def _record_page(self, job_id: str, candidate: dict, page_result: dict) -> bool:
         state = self.store.get(job_id)["state"]
         candidate_url = candidate["url"]
         error = page_result.get("error")
-        added = 0
+        records: list[dict] = []
         if error:
             warning = {"page_url": candidate_url, "round": state["current_round"], "message": str(error)}
             state["errors"].append(warning)
             state["warnings"].append(warning)
-            self.store.save(job_id, state, event=("warning", warning))
-            state = self.store.get(job_id)["state"]
 
         pages = page_result.get("pages") or []
         # Transitional adapter for test/custom processors that still return the old phone mapping.
@@ -442,8 +452,7 @@ class JobManager:
             website_url = str(page_data.get("website_url") or candidate.get("website_url") or f"{parts.scheme}://{parts.netloc}/")
             for raw_number in sorted(set(page_data.get("numbers") or [])):
                 number = self.normalize_phone_fn(str(raw_number))
-                current = self.store.get(job_id)["state"]
-                if not number or number in current["registered_numbers"] or len(current["results"]) >= current["requested_count"]:
+                if not number:
                     continue
                 phones = page_data.get("phone_sources") or {}
                 record = {
@@ -453,48 +462,17 @@ class JobManager:
                     "page_title": str(page_data.get("page_title") or ""),
                     "page_description": str(page_data.get("page_description") or ""),
                 }
-                current["registered_numbers"].append(number)
-                current["registered_numbers"].sort()
-                current["results"].append(record)
-                if candidate_url not in current["successful_page_urls"]:
-                    current["successful_page_urls"].append(candidate_url)
-                    current["successful_page_count"] = len(current["successful_page_urls"])
-                added += 1
-                self.store.save(job_id, current, event=("result_found", {
-                    "result": record,
-                    "successful_results": len(current["results"]),
-                    "total_unique_mobile_numbers": len(current["registered_numbers"]),
-                    "requested_count": current["requested_count"],
-                }))
+                records.append(record)
+        state = self.store.complete_url(job_id, candidate, records, str(error) if error else None)
+        return state.get("mode", "limited") == "limited" and len(state["results"]) >= state["requested_count"]
 
-        state = self.store.get(job_id)["state"]
-        info = state["page_statuses"].setdefault(candidate_url, {})
-        info["status"] = "failed" if error and added == 0 else "completed"
-        info["error"] = str(error) if error else None
-        info["new_results_count"] = added
-        state["processed_page_count"] += 1
-        state["processed_in_round"] += 1
-        self._update_round_counts(state)
-        self.store.save(job_id, state, event=("page_completed", {
-            "page_url": candidate_url,
-            "website_url": candidate.get("website_url"),
-            "status": info["status"],
-            "new_results_count": added,
-            "processed_page_count": state["processed_page_count"],
-            "successful_page_count": state["successful_page_count"],
-            "successful_results": len(state["results"]),
-            "requested_count": state["requested_count"],
-            "error": str(error) if error else None,
-        }))
-        return len(self.store.get(job_id)["state"]["results"]) >= self.store.get(job_id)["state"]["requested_count"]
-
-    def _skip_remaining_round_pages(self, job_id: str) -> None:
+    def _skip_remaining_round_pages(self, job_id: str, reason: str = "requested_result_count_reached") -> None:
         state = self.store.get(job_id)["state"]
         for page in state["round_pages"]:
             info = state["page_statuses"].get(page["url"], {})
-            if info.get("status") in {"pending", "processing"}:
+            if info.get("status") == "pending":
                 info["status"] = "skipped"
-                info["reason"] = "requested_result_count_reached"
+                info["reason"] = reason
         state["remaining_in_round"] = 0
         state["current_stage"] = "goal_reached"
         self.store.save(job_id, state, event=("progress", self._summary(state)))
@@ -511,6 +489,7 @@ class JobManager:
         has_exhaustion_note = any("exhausted before the requested" in item.get("message", "") for item in state["warnings"])
         if (
             status == "completed"
+            and state.get("mode", "limited") == "limited"
             and len(state["results"]) < state["requested_count"]
             and search_finished
             and not state["stop_after_round"]
@@ -521,8 +500,11 @@ class JobManager:
             })
         state["status"] = status
         state["current_stage"] = status
-        event_type = "job_failed" if status == "failed" else "job_completed"
+        event_type = "job_stopped" if status == "stopped" else ("job_failed" if status == "failed" else "job_completed")
         self.store.save(job_id, state, status=status, event=(event_type, self._summary(state)))
+
+    def request_stop(self, job_id: str) -> dict | None:
+        return self.store.request_stop(job_id)
 
     @staticmethod
     def _update_round_counts(state: dict) -> None:

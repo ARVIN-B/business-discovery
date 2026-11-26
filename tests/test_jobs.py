@@ -105,12 +105,12 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         end = asyncio.get_running_loop().time() + timeout
         while asyncio.get_running_loop().time() < end:
             state = self.manager.status(job_id)
-            if state["status"] in {"completed", "failed"}:
+            if state["status"] in {"completed", "failed", "stopped"}:
                 return state
             await asyncio.sleep(.01)
         self.fail("Job did not reach a terminal state")
 
-    async def test_flat_results_result_found_order_and_exact_source(self):
+    async def test_flat_results_are_published_atomically_per_url(self):
         job, created = self.manager.submit("کالا", "ایران", 3)
         self.assertTrue(created)
         final = await self.wait_terminal(job["job_id"])
@@ -122,16 +122,17 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         events = self.store.events_after(job["job_id"], 0)
         ids = [item["id"] for item in events]
         self.assertEqual(ids, list(range(1, len(ids) + 1)))
-        result_events = [item for item in events if item["event"] == "result_found"]
-        self.assertEqual(len(result_events), 3)
-        self.assertEqual([item["data"]["result"] for item in result_events], final["results"])
+        result_events = [item for item in events if item["event"] == "url_results_found"]
+        self.assertEqual(len(result_events), 2)
+        self.assertEqual([record for item in result_events for record in item["data"]["results"]], final["results"])
+        self.assertTrue(all(item["data"]["candidate_url"] for item in result_events))
         self.assertEqual(events[-1]["event"], "job_completed")
 
     async def test_same_domain_candidates_are_processed_independently_and_target_not_exceeded(self):
         job, _ = self.manager.submit("کالا", "ایران", 3)
         final = await self.wait_terminal(job["job_id"])
         self.assertEqual(final["successful_results"], 3)
-        self.assertLessEqual(final["successful_results"], final["requested_count"])
+        self.assertGreaterEqual(final["successful_results"], final["requested_count"])
         self.assertEqual(final["processed_page_count"], 2)
         self.assertEqual(final["successful_page_count"], 2)
         self.assertEqual(final["discovered_page_count"], 3)
@@ -139,7 +140,7 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["results"][2]["source_url"], "https://market.ir/listing/2")
         self.assertEqual(self.calls[0]["needed"], 5)
 
-    async def test_result_is_durable_before_slow_page_finishes_without_sse_reader(self):
+    async def test_started_concurrent_urls_finish_after_target_is_reached(self):
         slow_started = asyncio.Event()
         release_slow = asyncio.Event()
         async def search(keyword, province, needed, excluded_urls, round_number, start_page, initial_sites, page_callback, max_pages):
@@ -153,7 +154,7 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
             number = "09123456789" if page["url"].endswith("fast") else "09351234567"
             return {"pages": [extracted_page(page["url"], [number])]}
         self.manager.search_fn, self.manager.process_fn = search, process
-        job, _ = self.manager.submit("shop", "Iran", 2)
+        job, _ = self.manager.submit("shop", "Iran", 1)
         await asyncio.wait_for(slow_started.wait(), 1)
         for _ in range(100):
             if self.manager.status(job["job_id"])["successful_results"]:
@@ -163,7 +164,9 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["successful_results"], 1)
         self.assertEqual(state["results"][0]["source_url"], "https://same.ir/fast")
         release_slow.set()
-        await self.wait_terminal(job["job_id"])
+        final = await self.wait_terminal(job["job_id"])
+        self.assertEqual(final["successful_results"], 2)
+        self.assertEqual({record["number"] for record in final["results"]}, {"09123456789", "09351234567"})
 
     async def test_duplicate_number_keeps_first_url_and_number_target_caps_page(self):
         async def search(keyword, province, needed, excluded_urls, round_number, start_page, initial_sites, page_callback, max_pages):
@@ -178,7 +181,7 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         final = await self.wait_terminal(job["job_id"])
         self.assertEqual([item["number"] for item in final["results"]], ["09123456789", "09351234567", "09111111111"])
         self.assertEqual(final["results"][0]["source_url"], "https://market.ir/one")
-        self.assertEqual(len([event for event in self.store.events_after(job["job_id"], 0) if event["event"] == "result_found"]), 3)
+        self.assertEqual(len([event for event in self.store.events_after(job["job_id"], 0) if event["event"] == "url_results_found"]), 2)
 
     async def test_one_candidate_crawl_can_emit_flat_results_from_multiple_actual_pages(self):
         candidate_url = "https://market.ir/search/category"
@@ -199,6 +202,71 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual([item["page_title"] for item in final["results"]], ["Listing 1", "Listing 2"])
         self.assertEqual(final["successful_page_count"], 1)
+
+    async def test_limited_target_never_truncates_a_completed_url(self):
+        started = []
+        async def search(keyword, province, needed, excluded_urls, round_number, start_page, initial_sites, page_callback, max_pages):
+            pages = [candidate("https://market.ir/listing/overshoot"), candidate("https://market.ir/listing/extra")]
+            await page_callback(start_page + 1, pages, False)
+            return pages
+        async def process(page, _semaphore):
+            started.append(page["url"])
+            return {"pages": [extracted_page(page["url"], ["09123456789", "09351234567", "09444444444"])]}
+        self.manager.search_fn, self.manager.process_fn = search, process
+        self.manager.max_concurrent_sites = 1
+        job, _ = self.manager.submit("shop", "Iran", 1)
+        final = await self.wait_terminal(job["job_id"])
+        self.assertEqual(final["successful_results"], 3)
+        self.assertEqual(started, ["https://market.ir/listing/overshoot"])
+
+    async def test_unlimited_mode_processes_multiple_rounds_without_numeric_target(self):
+        async def search(keyword, province, needed, excluded_urls, round_number, start_page, initial_sites, page_callback, max_pages):
+            self.assertIsNone(needed)
+            page = candidate(f"https://round{round_number}.ir/listing/{round_number}")
+            await page_callback(start_page + 1, [page], False)
+            return [page]
+        async def process(page, _semaphore):
+            digit = page["url"].split("//round", 1)[1][0]
+            return {"pages": [extracted_page(page["url"], [f"0912345678{digit}"])]}
+        self.manager.search_fn, self.manager.process_fn = search, process
+        job, _ = self.manager.submit("shop", "Iran", None)
+        self.assertEqual(job["mode"], "unlimited")
+        final = await self.wait_terminal(job["job_id"])
+        self.assertIsNone(final["requested_count"])
+        self.assertEqual(final["mode"], "unlimited")
+        self.assertEqual(final["current_round"], 3)
+        self.assertEqual(final["successful_results"], 3)
+
+    async def test_stop_is_idempotent_and_waits_for_active_url(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        started = []
+        async def search(keyword, province, needed, excluded_urls, round_number, start_page, initial_sites, page_callback, max_pages):
+            pages = [candidate(f"https://market.ir/{index}") for index in range(3)]
+            await page_callback(start_page + 1, pages, False)
+            return pages
+        async def process(page, _semaphore):
+            started.append(page["url"])
+            entered.set()
+            await release.wait()
+            return {"pages": [extracted_page(page["url"], ["09123456789"])]}
+        self.manager.search_fn, self.manager.process_fn = search, process
+        self.manager.max_concurrent_sites = 1
+        job, _ = self.manager.submit("shop", "Iran", None)
+        await asyncio.wait_for(entered.wait(), 1)
+        first = self.manager.request_stop(job["job_id"])
+        second = self.manager.request_stop(job["job_id"])
+        self.assertEqual(first["status"], "running")
+        self.assertTrue(second["stop_requested"])
+        self.assertEqual(self.manager.status(job["job_id"])["status"], "running")
+        release.set()
+        final = await self.wait_terminal(job["job_id"])
+        self.assertEqual(final["status"], "stopped")
+        self.assertEqual(final["successful_results"], 1)
+        self.assertEqual(len(started), 1)
+        event_names = [item["event"] for item in self.store.events_after(job["job_id"], 0)]
+        self.assertIn("job_stop_requested", event_names)
+        self.assertEqual(event_names[-1], "job_stopped")
 
     async def test_homepage_is_valid_source_when_that_is_the_extracted_page(self):
         page_url = "https://example.ir/"
@@ -250,6 +318,18 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["successful_results"], 0)
         self.assertTrue(any("exhausted" in warning["message"].lower() for warning in final["warnings"]))
 
+    async def test_unlimited_search_exhaustion_completes_without_fake_target_warning(self):
+        async def empty_search(keyword, province, needed, excluded_urls, round_number, start_page, initial_sites, page_callback, max_pages):
+            self.assertIsNone(needed)
+            await page_callback(start_page + 1, [], True)
+            return []
+        self.manager.search_fn = empty_search
+        job, _ = self.manager.submit("shop", "Iran", None)
+        final = await self.wait_terminal(job["job_id"])
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["mode"], "unlimited")
+        self.assertFalse(any("requested unique mobile count" in item["message"] for item in final["warnings"]))
+
     async def test_idempotency_and_request_conflict(self):
         first, created = self.manager.submit("shop", "Iran", 1, idempotency_key="same-request")
         again, created_again = self.manager.submit("shop", "Iran", 1, idempotency_key="same-request")
@@ -294,7 +374,9 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         final = await self.wait_terminal(job_id)
         result_events = [item for item in reopened.events_after(job_id, 0) if item["event"] == "result_found"]
         self.assertEqual(final["successful_results"], 2)
-        self.assertEqual(len(result_events), 2)
+        self.assertEqual(len(result_events), 1)
+        atomic = [item for item in reopened.events_after(job_id, 0) if item["event"] == "url_results_found"]
+        self.assertEqual([record["number"] for item in atomic for record in item["data"]["results"]], ["09351234567"])
         self.assertEqual(reopened.get(job_id)["state"]["page_statuses"][url]["status"], "completed")
 
     async def test_v1_migration_flattens_history_and_never_reuses_domain_as_url(self):
@@ -320,7 +402,7 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         migrated = self.store.get(job_id)["state"]
         self.assertEqual(migrated["schema_version"], 2)
         self.assertEqual(len(migrated["results"]), 2)
-        self.assertEqual(migrated["requested_count"], 2)
+        self.assertEqual(migrated["requested_count"], 1)
         self.assertNotIn("market.ir", migrated["processed_urls"])
         self.assertEqual(migrated["legacy_processed_domains"], ["market.ir"])
         self.assertEqual(len(migrated["legacy_results"]), 1)
@@ -372,7 +454,7 @@ class SSEEndpointTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(result.status_code, 200)
                     self.assertEqual(result.json()["results"], status_json["results"])
                     sse = await client.get(job["events_url"], headers=headers)
-                    self.assertIn("event: result_found", sse.text)
+                    self.assertIn("event: url_results_found", sse.text)
                     self.assertIn("event: page_started", sse.text)
                     self.assertIn("event: page_completed", sse.text)
                     event_ids = [int(line[4:]) for line in sse.text.splitlines() if line.startswith("id: ")]
@@ -383,18 +465,25 @@ class SSEEndpointTests(unittest.IsolatedAsyncioTestCase):
                     event_records = []
                     rows = sse.text.split("\n\n")
                     for row in rows:
-                        if "event: result_found" not in row:
+                        if "event: url_results_found" not in row:
                             continue
                         data_line = next(line[6:] for line in row.splitlines() if line.startswith("data: "))
-                        event_records.append(json.loads(data_line)["result"])
+                        event_records.extend(json.loads(data_line)["results"])
                     self.assertEqual(event_records, result.json()["results"])
                     self.assertEqual(sse.text.split("event: ")[-1].splitlines()[0], "job_completed")
-                    result_row = next(row for row in sse.text.split("\n\n") if "event: result_found" in row)
+                    result_row = next(row for row in sse.text.split("\n\n") if "event: url_results_found" in row)
                     result_payload = json.loads(next(line[6:] for line in result_row.splitlines() if line.startswith("data: ")))
                     self.assertEqual(result_payload["schema_version"], 2)
-                    self.assertEqual(result_payload["result"]["source_url"], "https://divar.ir/v/real-listing")
+                    self.assertEqual(result_payload["candidate_url"], "https://divar.ir/v/real-listing")
+                    self.assertEqual(result_payload["results"][0]["source_url"], "https://divar.ir/v/real-listing")
                     unauthorized = await client.get(job["status_url"])
                     self.assertEqual(unauthorized.status_code, 401)
+
+                    unlimited = await client.post("/v1/discover", json={"keyword": "listing", "province": "Iran"}, headers=headers)
+                    self.assertEqual(unlimited.status_code, 202)
+                    self.assertEqual(unlimited.json()["mode"], "unlimited")
+                    self.assertIsNone(unlimited.json()["requested_count"])
+                    self.assertTrue(unlimited.json()["stop_url"].endswith("/stop"))
         finally:
             await manager.stop()
             temp.cleanup()

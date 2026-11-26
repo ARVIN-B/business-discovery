@@ -49,7 +49,7 @@ CONTACT_HINTS = ("contact", "about", "تماس", "درباره", "ارتباط")
 class DiscoverRequest(BaseModel):
     keyword: str = Field(min_length=1, max_length=120)
     province: str = Field(min_length=1, max_length=80, description="Province or location, e.g. اصفهان or ایران")
-    count: int = Field(ge=1, le=100)
+    count: int | None = Field(default=None, ge=1, le=100, description="Unique mobile number target; omit or null for unlimited discovery")
 
     @field_validator("keyword", "province")
     @classmethod
@@ -87,7 +87,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Iran Business Contact Discovery",
-    version="3.0.0",
+    version="4.0.0",
     lifespan=lifespan,
     docs_url=None,
     redoc_url=None,
@@ -155,7 +155,7 @@ def search_query_for_round(keyword: str, province: str, round_number: int) -> st
 async def search_sites(
     keyword: str,
     province: str,
-    needed: int,
+    needed: int | None,
     excluded_urls: set[str] | None = None,
     round_number: int = 1,
     start_page: int = 1,
@@ -172,7 +172,7 @@ async def search_sites(
         if normalized and normalized not in excluded:
             sites.setdefault(normalized, {**site, "url": normalized, "website_url": homepage_url(normalized)})
 
-    if len(sites) >= needed:
+    if needed is not None and len(sites) >= needed:
         return list(sites.values())[:needed]
 
     async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT, follow_redirects=True) as client:
@@ -210,9 +210,9 @@ async def search_sites(
             exhausted = len(items) == 0
             if page_callback:
                 await page_callback(page_no + 1, new_sites, exhausted)
-            if len(sites) >= needed or exhausted:
+            if (needed is not None and len(sites) >= needed) or exhausted:
                 break
-    return list(sites.values())[:needed]
+    return list(sites.values()) if needed is None else list(sites.values())[:needed]
 
 
 def normalize_mobile(raw: str) -> str | None:
@@ -491,8 +491,17 @@ async def create_discovery_job(
         "status_url": f"/v1/jobs/{job['job_id']}",
         "events_url": f"/v1/jobs/{job['job_id']}/events",
         "result_url": f"/v1/jobs/{job['job_id']}/result",
+        "stop_url": f"/v1/jobs/{job['job_id']}/stop",
     })
     return job
+
+
+@app.post("/v1/jobs/{job_id}/stop", status_code=202, dependencies=[Depends(require_key)])
+async def stop_discovery_job(job_id: str, request: Request):
+    outcome = get_job_manager(request).request_stop(job_id)
+    if outcome is None:
+        raise HTTPException(status_code=404, detail="Job not found or expired")
+    return {"job_id": job_id, **outcome}
 
 
 @app.get("/v1/jobs/{job_id}/events", dependencies=[Depends(require_key)])

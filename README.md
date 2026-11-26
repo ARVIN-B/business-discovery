@@ -1,6 +1,6 @@
 # Business Discovery API
 
-Independent FastAPI service that searches local SearXNG and uses the existing Firecrawl service to discover Iranian mobile numbers. Discovery runs as a durable job and publishes each newly accepted unique mobile number over SSE as soon as its page-processing task completes.
+Independent FastAPI service that searches local SearXNG and uses the existing Firecrawl service to discover Iranian mobile numbers. Discovery runs as a durable job and publishes all new unique numbers from a candidate URL together after that URL finishes.
 
 ## Runtime
 
@@ -21,7 +21,7 @@ Every normalized full URL is an independent search candidate. Multiple listing, 
 
 Firecrawl may return several crawled pages for one candidate URL. Each extracted mobile number is associated with the actual normalized page URL and metadata returned for that page. `website_url` is the root origin for secondary display; `source_url` is the primary clickable result. The API does not infer names or descriptions. Missing metadata is an empty string.
 
-`count` means the target number of unique valid Iranian mobile numbers. It does not mean websites, domains, or candidate pages. Numbers are normalized to `09xxxxxxxxx`, deduplicated across the whole job, and limited to the first valid source encountered. One source page can produce multiple flat result records. Concurrent page tasks cannot add more results than requested.
+`count` means the target number of unique valid Iranian mobile numbers; omit it or set it to `null` for unlimited discovery. Numbers are normalized to `09xxxxxxxxx`, deduplicated across the whole job, and limited to the first valid source encountered. One URL can return multiple flat result records. In limited mode, `count` is a URL-boundary threshold: if a URL takes the job past the target, all newly found numbers from that URL are returned. URLs already processing concurrently also finish and publish their complete results; the service starts no further URLs after the threshold is met.
 
 ## API workflow (schema version 2)
 
@@ -43,11 +43,19 @@ Idempotency-Key: optional-client-generated-key
 {"keyword":"آگهی موبایل","province":"اصفهان","count":5}
 ```
 
+For unlimited mode:
+
+```json
+{"keyword":"آگهی موبایل","province":"اصفهان","count":null}
+```
+
+The `count` field may also be omitted. Unlimited jobs continue through the configured search rounds and pagination until the available search space is exhausted or the client stops the job.
+
 Returns HTTP `202 Accepted` with `job_id`, `schema_version: 2`, and relative `status_url`, `events_url`, and `result_url`. Reusing the same idempotency key and body returns the existing job; reusing it with a different body returns `409`.
 
 ### Job status
 
-`GET /v1/jobs/{job_id}` returns status, accumulated flat results, warnings/errors, current round and stage, and page metrics. Status is `queued`, `running`, `completed`, or `failed`.
+`GET /v1/jobs/{job_id}` returns mode, status, accumulated flat results, warnings/errors, current round and stage, and page metrics. Status is `queued`, `running`, `completed`, `failed`, or `stopped`.
 
 ```json
 {
@@ -78,15 +86,24 @@ Page metrics describe candidate URLs returned by SearXNG and processed by the ap
 
 `GET /v1/jobs/{job_id}/events` streams persisted events as `text/event-stream`. Processing continues if the SSE client disconnects. Event IDs increase monotonically; reconnect using `Last-Event-ID` or `?last_event_id=...`. The service replays every later event in order and sends heartbeat comments every 15 seconds while idle.
 
-Each unique accepted phone produces one `result_found` event, persisted atomically with the result:
+Each completed URL with new numbers produces one `url_results_found` event containing its complete result list. The URL results, page completion state, and event are persisted in one SQLite transaction:
 
 ```text
 id: 25
-event: result_found
-data: {"result":{"number":"09123456789","source_url":"https://divar.ir/v/listing-1","website_url":"https://divar.ir/","page_title":"عنوان واقعی آگهی","page_description":""},"successful_results":1,"total_unique_mobile_numbers":1,"requested_count":5}
+event: url_results_found
+data: {"candidate_url":"https://divar.ir/v/listing-1","results":[{"number":"09123456789","source_url":"https://divar.ir/v/listing-1","website_url":"https://divar.ir/","page_title":"عنوان واقعی آگهی","page_description":""}],"successful_results":1,"total_unique_mobile_numbers":1,"requested_count":5,"mode":"limited"}
 ```
 
-Page lifecycle events are URL-oriented. For example, `page_completed` includes `page_url`, `website_url`, `status`, `new_results_count`, `processed_page_count`, `successful_page_count`, `successful_results`, and `requested_count`. Other events include `job_started`, `round_started`, `search_completed`, `progress`, `warning`, `round_completed`, `job_completed`, and `job_failed`. The terminal `job_completed` event contains the final counters and flat result array.
+Page lifecycle events are URL-oriented. For example, `page_completed` includes `page_url`, `website_url`, `status`, `new_results_count`, `processed_page_count`, `successful_page_count`, `successful_results`, and `requested_count`. Other events include `job_started`, `round_started`, `search_completed`, `progress`, `warning`, `round_completed`, `job_stop_requested`, `job_stopped`, `job_completed`, and `job_failed`. The terminal event contains the final counters and flat result array.
+
+### Stop a job
+
+```http
+POST /v1/jobs/{job_id}/stop
+Authorization: Bearer <API_KEY>
+```
+
+Returns `202 Accepted`. Repeated requests are safe. The service stops starting new URLs after the request is accepted, lets URLs already in progress finish, then reports terminal status `stopped` and emits `job_stopped`. A running job remains `running` while any active URL is finishing.
 
 ### Final result
 
@@ -118,13 +135,13 @@ Page lifecycle events are URL-oriented. For example, `page_completed` includes `
 }
 ```
 
-`successful_results == total_unique_mobile_numbers == len(results)`, and the count never exceeds `requested_count`. When all search rounds/pages are exhausted first, the job finishes as `completed` with its actual results and a warning that the requested count was not reached. Provider errors remain in `errors`/`warnings` and do not erase previously stored results. `404` means unknown or expired job; `401` means invalid/missing token.
+`successful_results == total_unique_mobile_numbers == len(results)`. Limited jobs can exceed `requested_count` because the whole URL that reaches the threshold, and any URLs already active concurrently, publish all their numbers. Unlimited jobs return `requested_count: null`. When search rounds/pages are exhausted, either mode finishes as `completed`; limited jobs include a warning if they did not reach their target. Provider errors remain in `errors`/`warnings` and do not erase previously stored results. `404` means unknown or expired job; `401` means invalid/missing token.
 
 ## Search, crawl, and recovery behavior
 
-The service retains up to three search rounds, its existing query variations, `ceil(remaining_unique_numbers * 1.6)` URL target, SearXNG pagination limit, Firecrawl page/depth/time limits, and site concurrency. Pagination state is independent for each exact search query. Search result candidates and processed state are deduplicated by normalized full URL, not host.
+The service retains up to three search rounds, its existing query variations, `ceil(remaining_unique_numbers * 1.6)` URL target in limited mode, SearXNG pagination limit, Firecrawl page/depth/time limits, and site concurrency. Unlimited mode has no numeric URL/result target. Pagination state is independent for each exact search query. Search result candidates and processed state are deduplicated by normalized full URL, not host.
 
-SQLite state uses `schema_version: 2`. On startup, legacy v1 nested website results are migrated to flat records, keeping the first occurrence of each valid mobile number and adding replayable `result_found` events where absent. Legacy processed domain strings are retained for audit only and are never treated as URL exclusions. Existing event history is kept.
+Public result/event payloads retain `schema_version: 2`. An internal job model marker distinguishes new limited/unlimited and stop behavior from migrated jobs. On startup, legacy v1 nested website results are migrated to flat records, keeping the first occurrence of each valid mobile number and preserving the stored requested target. Legacy processed domain strings are retained for audit only and are never treated as URL exclusions. Existing event history is kept.
 
 ## Configuration and Chabokan
 

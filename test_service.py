@@ -14,7 +14,8 @@ from urllib.parse import urljoin, urlsplit
 BASE_URL = os.getenv("TEST_BASE_URL", "http://127.0.0.1:8091").rstrip("/")
 TEST_KEYWORD = os.getenv("TEST_KEYWORD", "رستوران")
 TEST_PROVINCE = os.getenv("TEST_PROVINCE", "اصفهان")
-TEST_COUNT = int(os.getenv("TEST_COUNT", "1"))
+_COUNT_VALUE = os.getenv("TEST_COUNT", "1").strip().lower()
+TEST_COUNT = None if _COUNT_VALUE in {"", "null", "none", "unlimited"} else int(_COUNT_VALUE)
 JOB_TIMEOUT = int(os.getenv("TEST_JOB_TIMEOUT_SECONDS", "3600"))
 ENV_FILE = Path("/opt/business-discovery/.env")
 
@@ -93,8 +94,8 @@ def validate_result(record):
 
 
 def main():
-    if not 1 <= TEST_COUNT <= 100:
-        raise RuntimeError("TEST_COUNT must be between 1 and 100")
+    if TEST_COUNT is not None and not 1 <= TEST_COUNT <= 100:
+        raise RuntimeError("TEST_COUNT must be between 1 and 100, or null/unlimited")
     if JOB_TIMEOUT < 1:
         raise RuntimeError("TEST_JOB_TIMEOUT_SECONDS must be positive")
     key = read_key()
@@ -128,7 +129,7 @@ def main():
         status, job = request(status_url, headers=auth, timeout=30)
         if status != 200 or job.get("schema_version") != 2:
             raise RuntimeError("Status endpoint returned an invalid response")
-        if job.get("status") in {"completed", "failed"}:
+        if job.get("status") in {"completed", "failed", "stopped"}:
             break
         time.sleep(1)
     print(
@@ -142,7 +143,7 @@ def main():
 
     status, final = request(result_url, headers=auth, timeout=30)
     required = {
-        "schema_version", "job_id", "status", "requested_count", "successful_results",
+        "schema_version", "job_id", "status", "mode", "requested_count", "successful_results",
         "total_unique_mobile_numbers", "discovered_page_count", "processed_page_count",
         "successful_page_count", "completed_rounds", "results", "errors", "warnings",
     }
@@ -153,8 +154,6 @@ def main():
     count = len(final["results"])
     if not (final["successful_results"] == final["total_unique_mobile_numbers"] == count):
         raise RuntimeError("Unique result counters do not match the flat result array")
-    if final["successful_results"] > final["requested_count"]:
-        raise RuntimeError("The API returned more unique results than requested")
 
     seen = set()
     print(f"Unique mobile records: {count}")
@@ -175,13 +174,13 @@ def main():
     event_names = [event.get("event") for event in events]
     if event_names[0] != "job_started" or event_names[-1] != "job_completed":
         raise RuntimeError("SSE lifecycle events are incomplete")
-    streamed = [event["data"].get("result") for event in events if event.get("event") == "result_found"]
+    streamed = [record for event in events if event.get("event") == "url_results_found" for record in event["data"].get("results", [])]
     if streamed != final["results"]:
-        raise RuntimeError("result_found events do not reproduce the final flat results")
+        raise RuntimeError("url_results_found events do not reproduce the final flat results")
     page_events = [event for event in events if event.get("event") == "page_completed"]
     if any("page_url" not in event["data"] or "website_url" not in event["data"] for event in page_events):
         raise RuntimeError("A page_completed event is missing URL-level identity")
-    print(f"SSE: {len(streamed)} result_found events, {len(page_events)} page_completed events, ordered IDs {ids[0]}–{ids[-1]}")
+    print(f"SSE: {len([event for event in events if event.get('event') == 'url_results_found'])} URL result events, {len(page_events)} page_completed events, ordered IDs {ids[0]}–{ids[-1]}")
     for warning in final["warnings"]:
         print(f"Warning: {warning}")
     print("Live integration test: PASS")
