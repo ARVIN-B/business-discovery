@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live smoke test for the local API using the real SearXNG and Firecrawl services."""
+"""Live smoke test for the local API using real SearXNG and Firecrawl services."""
 import json
 import os
 import sys
@@ -8,7 +8,9 @@ import urllib.request
 from pathlib import Path
 
 BASE_URL = os.getenv("TEST_BASE_URL", "http://127.0.0.1:8091")
+TEST_COUNT = int(os.getenv("TEST_COUNT", "1"))
 ENV_FILE = Path("/opt/business-discovery/.env")
+
 
 def read_key():
     if os.getenv("API_KEY"):
@@ -18,7 +20,8 @@ def read_key():
             return line.partition("=")[2].strip().strip('"').strip("'")
     raise RuntimeError("API_KEY not found in environment or service env file")
 
-def request(url, *, payload=None, headers=None, timeout=1200):
+
+def request(url, *, payload=None, headers=None, timeout=1800):
     data = json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, headers=headers or {}, method="POST" if data else "GET")
     try:
@@ -28,29 +31,37 @@ def request(url, *, payload=None, headers=None, timeout=1200):
         detail = exc.read().decode(errors="replace")[:1000]
         raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
 
+
 try:
     status, health = request(BASE_URL + "/health", timeout=10)
     if status != 200 or health.get("status") != "ok":
         raise RuntimeError(f"Health check failed: status={status}, body={health}")
     print("Health: OK")
-    status, result = request(BASE_URL + "/v1/discover", payload={"keyword": "رستوران", "province": "اصفهان", "count": 2}, headers={"Content-Type": "application/json", "Authorization": "Bearer " + read_key()}, timeout=1800)
-    if status != 200:
-        raise RuntimeError(f"Discovery returned HTTP {status}")
-    required = {"keyword", "province", "requested_count", "discovered_urls", "processed_websites", "results", "warnings"}
-    if not required.issubset(result) or not isinstance(result["results"], list):
-        raise RuntimeError("Response JSON does not match the expected structure")
-    print(f"Discovered URLs: {result['discovered_urls']}")
-    print(f"Processed websites: {result['processed_websites']}")
-    for item in result["results"]:
-        if not {"business_name", "website", "discovered_url", "pages_processed", "phones"}.issubset(item):
-            raise RuntimeError("A result is missing required fields")
-        print(f"\nBusiness: {item['business_name']}\nWebsite: {item['website']}\nDiscovered URL: {item['discovered_url']}\nPages processed: {item['pages_processed']}")
-        if item.get("error"):
-            print(f"  Crawl error: {item['error']}")
-        for phone in item["phones"]:
-            print(f"  {phone['type']}: {phone['number']} (source: {phone['source_url']})")
-    if result["warnings"]:
-        print("Warnings: " + "; ".join(result["warnings"]))
+
+    status, result = request(
+        BASE_URL + "/v1/discover",
+        payload={"keyword": "رستوران", "province": "اصفهان", "count": TEST_COUNT},
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + read_key()},
+        timeout=1800,
+    )
+    required = {
+        "requested_count", "successful_websites", "total_unique_mobile_numbers",
+        "completed_rounds", "results",
+    }
+    if status != 200 or not required.issubset(result) or not isinstance(result["results"], list):
+        raise RuntimeError("Discovery response does not match the expected JSON structure")
+
+    print(f"Successful websites: {result['successful_websites']}")
+    print(f"Unique mobile numbers: {result['total_unique_mobile_numbers']}")
+    print(f"Completed search rounds: {result['completed_rounds']}")
+    for website in result["results"]:
+        if not {"website_url", "mobile_numbers"}.issubset(website):
+            raise RuntimeError("A website result is missing required fields")
+        print(f"\nWebsite: {website['website_url']}")
+        for phone in website["mobile_numbers"]:
+            if not {"number", "source_url"}.issubset(phone):
+                raise RuntimeError("A mobile number is missing its source URL")
+            print(f"  Mobile: {phone['number']} (source: {phone['source_url']})")
     print("Live test: PASS")
 except Exception as exc:
     print(f"Live test: FAIL: {exc}", file=sys.stderr)

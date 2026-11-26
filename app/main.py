@@ -9,7 +9,8 @@ import re
 import secrets
 import time
 from contextlib import asynccontextmanager
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, urljoin
+from math import ceil
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -26,10 +27,16 @@ CRAWL_TIMEOUT = float(os.getenv("CRAWL_TIMEOUT", "240"))
 MAX_CRAWL_PAGES = int(os.getenv("MAX_CRAWL_PAGES", "10"))
 MAX_CRAWL_DEPTH = int(os.getenv("MAX_CRAWL_DEPTH", "2"))
 MAX_CONCURRENT_SITES = int(os.getenv("MAX_CONCURRENT_SITES", "3"))
-MOBILE_RE = re.compile(r"(?<!\d)(?:(?:\+?98|0098)[\s().-]*|0)?9\d{2}[\s().-]*\d{3}[\s().-]*\d{4}(?!\d)")
-LANDLINE_RE = re.compile(r"(?<!\d)(?:(?:\+?98|0098)[\s().-]*|0)(?:[1-8]\d)[\s().-]*\d{3}[\s().-]*\d{4}(?!\d)")
+MAX_SEARCH_ROUNDS = 3
+SEARCH_URL_FACTOR = 1.6
+
+# Mobile numbers only. Boundaries prevent extracting 11 digits from a longer number.
+MOBILE_RE = re.compile(
+    r"(?<!\d)(?:(?:\+?98|0098)[\s().-]*)?0?9\d{2}[\s().-]*\d{3}[\s().-]*\d{4}(?!\d)"
+)
 DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 CONTACT_HINTS = ("contact", "about", "تماس", "درباره", "ارتباط")
+
 
 class DiscoverRequest(BaseModel):
     keyword: str = Field(min_length=1, max_length=120)
@@ -44,22 +51,27 @@ class DiscoverRequest(BaseModel):
             raise ValueError("must not be blank")
         return value
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not API_KEY or len(API_KEY) < 32:
         raise RuntimeError("API_KEY must be configured as a random secret of at least 32 characters")
     yield
 
-app = FastAPI(title="Iran Business Contact Discovery", version="1.0.0", lifespan=lifespan)
+
+app = FastAPI(title="Iran Business Contact Discovery", version="1.1.0", lifespan=lifespan)
+
 
 async def require_key(authorization: str | None = Header(default=None)) -> None:
     supplied = authorization.removeprefix("Bearer ") if authorization else ""
     if not secrets.compare_digest(supplied, API_KEY):
         raise HTTPException(status_code=401, detail="Invalid or missing bearer token", headers={"WWW-Authenticate": "Bearer"})
 
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "business-discovery"}
+
 
 def normalize_url(value: str) -> str | None:
     try:
@@ -84,179 +96,281 @@ def normalize_url(value: str) -> str | None:
     except (ValueError, UnicodeError):
         return None
 
+
 def domain_of(url: str) -> str:
     return (urlsplit(url).hostname or "").lower().removeprefix("www.")
 
-async def search_sites(keyword: str, province: str, needed: int) -> list[dict]:
-    urls: dict[str, dict] = {}
+
+def homepage_url(url: str) -> str:
+    parsed = urlsplit(url)
+    return urlunsplit((parsed.scheme, parsed.netloc, "/", "", ""))
+
+
+async def search_sites(
+    keyword: str,
+    province: str,
+    needed: int,
+    excluded_domains: set[str] | None = None,
+    round_number: int = 1,
+) -> list[dict]:
+    excluded = excluded_domains or set()
     query = f"{keyword} {province} ایران"
+    if round_number == 2:
+        query += " شماره تماس"
+    elif round_number == 3:
+        query += " سایت رسمی تماس"
+    sites: dict[str, dict] = {}
     async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT, follow_redirects=True) as client:
         for page_no in range(1, 9):
             try:
-                response = await client.get(f"{SEARXNG_URL.rstrip('/')}/search", params={"q": query, "format": "json", "language": "fa-IR", "pageno": page_no})
+                response = await client.get(
+                    f"{SEARXNG_URL.rstrip('/')}/search",
+                    params={"q": query, "format": "json", "language": "fa-IR", "pageno": page_no},
+                )
                 response.raise_for_status()
                 results = response.json().get("results", [])
             except (httpx.HTTPError, ValueError) as exc:
-                if not urls:
+                if not sites and not excluded:
                     raise RuntimeError(f"SearXNG request failed: {type(exc).__name__}") from exc
-                log.warning("SearXNG page %s failed (%s)", page_no, type(exc).__name__)
+                log.warning("SearXNG page %s in round %s failed (%s)", page_no, round_number, type(exc).__name__)
                 break
             for item in results:
                 normalized = normalize_url(str(item.get("url", "")))
                 if not normalized:
                     continue
                 domain = domain_of(normalized)
-                if domain not in urls:
-                    urls[domain] = {"url": normalized, "search_url": normalized, "title": str(item.get("title", ""))[:300]}
-            if len(urls) >= needed:
+                if domain in excluded or domain in sites:
+                    continue
+                sites[domain] = {
+                    "url": normalized,
+                    "website_url": homepage_url(normalized),
+                    "title": str(item.get("title", ""))[:300],
+                }
+            if len(sites) >= needed:
                 break
-    return list(urls.values())[:needed]
+    return list(sites.values())[:needed]
 
-def normalize_phone(raw: str, mobile: bool) -> str | None:
+
+def normalize_mobile(raw: str) -> str | None:
     digits = re.sub(r"\D", "", raw.translate(DIGITS))
     if digits.startswith("0098"):
-        digits = "0" + digits[4:]
-    elif digits.startswith("98") and len(digits) >= 11:
-        digits = "0" + digits[2:]
-    if mobile:
-        if len(digits) == 10 and digits.startswith("9"):
-            digits = "0" + digits
-        return digits if re.fullmatch(r"09\d{9}", digits) else None
-    return digits if re.fullmatch(r"0[1-8]\d{9}", digits) else None
+        digits = digits[4:]
+    elif digits.startswith("98") and len(digits) == 12:
+        digits = digits[2:]
+    if len(digits) == 10 and digits.startswith("9"):
+        digits = "0" + digits
+    return digits if re.fullmatch(r"09\d{9}", digits) else None
 
-def extract_phones(content: str) -> list[dict]:
+
+def extract_mobile_numbers(content: str) -> list[str]:
     text = html.unescape(content).translate(DIGITS)
-    found = {}
-    for kind, pattern in (("mobile", MOBILE_RE), ("landline", LANDLINE_RE)):
-        for match in pattern.finditer(text):
-            number = normalize_phone(match.group(), kind == "mobile")
-            if number:
-                found[number] = kind
-    return [{"number": n, "type": found[n]} for n in sorted(found)]
+    found = {normalized for match in MOBILE_RE.finditer(text) if (normalized := normalize_mobile(match.group()))}
+    return sorted(found)
+
 
 async def firecrawl_crawl(client: httpx.AsyncClient, site: dict) -> tuple[list[dict], str | None]:
-    start = site["url"]
     try:
-        created = await client.post(f"{FIRECRAWL_URL.rstrip('/')}/v2/crawl", json={
-            "url": start, "limit": MAX_CRAWL_PAGES, "maxDiscoveryDepth": MAX_CRAWL_DEPTH,
-            "scrapeOptions": {"formats": ["markdown", "rawHtml"], "onlyMainContent": False, "timeout": 45000}
-        }, timeout=45)
+        created = await client.post(
+            f"{FIRECRAWL_URL.rstrip('/')}/v2/crawl",
+            json={
+                "url": site["url"],
+                "limit": MAX_CRAWL_PAGES,
+                "maxDiscoveryDepth": MAX_CRAWL_DEPTH,
+                "scrapeOptions": {"formats": ["markdown", "rawHtml"], "onlyMainContent": False, "timeout": 45000},
+            },
+            timeout=45,
+        )
         created.raise_for_status()
-        job = created.json()
-        job_id = job.get("id")
+        job_id = created.json().get("id")
         if not job_id:
             return [], "Firecrawl did not return a crawl job id"
         end = time.monotonic() + CRAWL_TIMEOUT
-        partial_pages: list[dict] = []
-        partial_next = None
+        pages: list[dict] = []
         while time.monotonic() < end:
-            result = await client.get(f"{FIRECRAWL_URL.rstrip('/')}/v2/crawl/{job_id}", timeout=30)
-            result.raise_for_status()
-            payload = result.json()
-            partial_pages = list(payload.get("data") or partial_pages)
-            partial_next = payload.get("next") or partial_next
+            response = await client.get(f"{FIRECRAWL_URL.rstrip('/')}/v2/crawl/{job_id}", timeout=30)
+            response.raise_for_status()
+            payload = response.json()
+            pages = list(payload.get("data") or pages)
             status = payload.get("status")
             if status == "completed":
-                pages = list(payload.get("data") or [])
                 next_url = payload.get("next")
                 while next_url:
-                    path = urlsplit(next_url)
-                    page = await client.get(FIRECRAWL_URL.rstrip("/") + (path.path + ("?" + path.query if path.query else "")), timeout=30)
-                    page.raise_for_status()
-                    pg = page.json()
-                    pages.extend(pg.get("data") or [])
-                    next_url = pg.get("next")
+                    parsed = urlsplit(next_url)
+                    page_response = await client.get(
+                        FIRECRAWL_URL.rstrip("/") + parsed.path + ("?" + parsed.query if parsed.query else ""),
+                        timeout=30,
+                    )
+                    page_response.raise_for_status()
+                    page_data = page_response.json()
+                    pages.extend(page_data.get("data") or [])
+                    next_url = page_data.get("next")
                 return pages, None
             if status in {"failed", "cancelled"}:
-                return [], f"Firecrawl job {status}"
+                return pages, f"Firecrawl job {status}"
             await asyncio.sleep(3)
         try:
             await client.delete(f"{FIRECRAWL_URL.rstrip('/')}/v2/crawl/{job_id}", timeout=10)
         except httpx.HTTPError:
             log.warning("Could not cancel timed-out Firecrawl crawl")
-        message = "Firecrawl crawl timed out with partial results" if partial_pages else "Firecrawl crawl timed out"
-        return partial_pages, message
+        return pages, "Firecrawl crawl timed out"
     except (httpx.HTTPError, ValueError) as exc:
         return [], f"Firecrawl request failed: {type(exc).__name__}"
+
+
+def page_source(page: dict, fallback: str) -> str:
+    metadata = page.get("metadata") or {}
+    return normalize_url(str(metadata.get("sourceURL") or metadata.get("url") or page.get("url") or fallback)) or fallback
+
+
+def page_priority(page: dict, fallback: str) -> tuple[int, int]:
+    path = unquote(urlsplit(page_source(page, fallback)).path).strip("/").lower()
+    if not path:
+        return (0, 0)
+    if any(hint in path for hint in CONTACT_HINTS):
+        return (1, len(path))
+    return (2, len(path))
+
 
 async def process_site(client: httpx.AsyncClient, site: dict, semaphore: asyncio.Semaphore) -> dict:
     async with semaphore:
         pages, error = await firecrawl_crawl(client, site)
     if error and not pages:
-        return {"business_name": site.get("title") or domain_of(site["url"]), "website": site["url"], "discovered_url": site.get("search_url", site["url"]), "pages_processed": 0, "phones": [], "error": error}
-    title = site.get("title") or domain_of(site["url"])
-    contacts: dict[str, dict] = {}
+        log.warning("Skipping failed website %s (%s)", site["website_url"], error)
+        return {"website_url": site["website_url"], "phones": {}, "error": error}
 
-    def priority(page: dict) -> tuple[int, int]:
-        metadata = page.get("metadata") or {}
-        source = str(metadata.get("sourceURL") or metadata.get("url") or page.get("url") or site["url"])
-        path = urlsplit(source).path.strip("/").lower()
-        if not path:
-            return (0, 0)
-        if any(hint in path for hint in CONTACT_HINTS):
-            return (1, len(path))
-        return (2, len(path))
-
-    pages.sort(key=priority)
+    pages.sort(key=lambda page: page_priority(page, site["url"]))
+    phones: dict[str, str] = {}
     for page in pages:
-        metadata = page.get("metadata") or {}
-        source = normalize_url(str(metadata.get("sourceURL") or metadata.get("url") or page.get("url") or site["url"])) or site["url"]
+        source = page_source(page, site["url"])
         if domain_of(source) != domain_of(site["url"]):
             continue
-        content = "\n".join(str(page.get(k) or "") for k in ("markdown", "html", "rawHtml"))
-        if not title or title == domain_of(site["url"]):
-            title = str(metadata.get("title") or title)
-        for number in extract_phones(content):
-            contacts.setdefault(number["number"], {**number, "source_url": source})
+        content = "\n".join(str(page.get(key) or "") for key in ("markdown", "html", "rawHtml"))
+        for number in extract_mobile_numbers(content):
+            phones.setdefault(number, source)
 
-    if not contacts:
+    # If the bounded crawl did not find any mobile, scrape up to three explicit
+    # contact/about links from the pages already collected.
+    if not phones:
         candidates: list[str] = []
         for page in pages:
-            metadata = page.get("metadata") or {}
-            source = str(metadata.get("sourceURL") or metadata.get("url") or page.get("url") or site["url"])
-            raw = "\n".join(str(page.get(k) or "") for k in ("html", "rawHtml"))
+            source = page_source(page, site["url"])
+            raw = "\n".join(str(page.get(key) or "") for key in ("html", "rawHtml"))
             for _, href in re.findall(r'href\s*=\s*(["\'])(.*?)\1', raw, flags=re.I):
                 link = normalize_url(urljoin(source, html.unescape(href)))
                 if link and domain_of(link) == domain_of(site["url"]):
-                    path = urlsplit(link).path.lower()
+                    path = unquote(urlsplit(link).path).lower()
                     if any(hint in path for hint in CONTACT_HINTS) and link not in candidates:
                         candidates.append(link)
         async with httpx.AsyncClient(timeout=45, follow_redirects=False) as scrape_client:
             for target in candidates[:3]:
                 try:
-                    response = await scrape_client.post(f"{FIRECRAWL_URL.rstrip('/')}/v2/scrape", json={
-                        "url": target, "formats": ["markdown", "rawHtml"], "onlyMainContent": False, "timeout": 35000
-                    })
+                    response = await scrape_client.post(
+                        f"{FIRECRAWL_URL.rstrip('/')}/v2/scrape",
+                        json={"url": target, "formats": ["markdown", "rawHtml"], "onlyMainContent": False, "timeout": 35000},
+                    )
                     response.raise_for_status()
                     data = response.json().get("data") or {}
-                    content = "\n".join(str(data.get(k) or "") for k in ("markdown", "html", "rawHtml"))
+                    content = "\n".join(str(data.get(key) or "") for key in ("markdown", "html", "rawHtml"))
                     metadata = data.get("metadata") or {}
                     source = normalize_url(str(metadata.get("sourceURL") or metadata.get("url") or target)) or target
-                    for number in extract_phones(content):
-                        contacts.setdefault(number["number"], {**number, "source_url": source})
+                    if domain_of(source) == domain_of(site["url"]):
+                        for number in extract_mobile_numbers(content):
+                            phones.setdefault(number, source)
                 except (httpx.HTTPError, ValueError) as exc:
                     log.warning("Contact page scrape failed (%s)", type(exc).__name__)
-                if contacts:
-                    break
-    result = {"business_name": title[:300], "website": site["url"], "discovered_url": site.get("search_url", site["url"]), "pages_processed": len(pages), "phones": list(contacts.values())}
+
     if error:
-        result["error"] = error
-    return result
+        log.warning("Partial crawl for %s (%s)", site["website_url"], error)
+    return {"website_url": site["website_url"], "phones": phones, "error": error}
+
+
+async def run_discovery(
+    keyword: str,
+    province: str,
+    target_count: int,
+    search_fn=None,
+    process_fn=None,
+) -> dict:
+    search_fn = search_fn or search_sites
+    process_fn = process_fn or process_site
+    processed_domains: set[str] = set()
+    registered_numbers: set[str] = set()
+    results: list[dict] = []
+    completed_rounds = 0
+
+    for round_number in range(1, MAX_SEARCH_ROUNDS + 1):
+        remaining = target_count - len(results)
+        if remaining <= 0:
+            break
+        url_target = ceil(remaining * SEARCH_URL_FACTOR)
+        try:
+            sites = await search_fn(
+                keyword,
+                province,
+                url_target,
+                excluded_domains=processed_domains,
+                round_number=round_number,
+            )
+        except RuntimeError:
+            if completed_rounds == 0:
+                raise
+            log.exception("SearXNG failed in round %s; returning collected results", round_number)
+            break
+        completed_rounds = round_number
+
+        unique_sites: list[dict] = []
+        for site in sites:
+            normalized = normalize_url(str(site.get("url", "")))
+            if not normalized:
+                continue
+            domain = domain_of(normalized)
+            if domain in processed_domains:
+                continue
+            processed_domains.add(domain)
+            unique_sites.append({**site, "url": normalized, "website_url": homepage_url(normalized)})
+
+        if not unique_sites:
+            continue
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60, connect=10), follow_redirects=False) as client:
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT_SITES)
+            for offset in range(0, len(unique_sites), MAX_CONCURRENT_SITES):
+                batch = unique_sites[offset : offset + MAX_CONCURRENT_SITES]
+                batch_results = await asyncio.gather(*(process_fn(client, site, semaphore) for site in batch))
+                for site_result in batch_results:
+                    if site_result.get("error"):
+                        log.warning("Website processing issue: %s", site_result["error"])
+                    site_phones = site_result.get("phones") or {}
+                    new_numbers = [number for number in site_phones if number not in registered_numbers]
+                    if not new_numbers:
+                        continue
+                    website_result = {"website_url": site_result["website_url"], "mobile_numbers": []}
+                    for number in new_numbers:
+                        registered_numbers.add(number)
+                        website_result["mobile_numbers"].append(
+                            {"number": number, "source_url": site_phones[number]}
+                        )
+                    results.append(website_result)
+                    if len(results) >= target_count:
+                        break
+                if len(results) >= target_count:
+                    break
+        if len(results) >= target_count:
+            break
+
+    return {
+        "requested_count": target_count,
+        "successful_websites": len(results),
+        "total_unique_mobile_numbers": len(registered_numbers),
+        "completed_rounds": completed_rounds,
+        "results": results,
+    }
+
 
 @app.post("/v1/discover", dependencies=[Depends(require_key)])
 async def discover(body: DiscoverRequest):
-    target_count = body.count
     try:
-        sites = await search_sites(body.keyword, body.province, max(target_count + max(1, (target_count + 9) // 10), target_count))
+        return await run_discovery(body.keyword, body.province, body.count)
     except RuntimeError as exc:
         log.error("Search failed: %s", exc)
         raise HTTPException(status_code=502, detail="Search provider unavailable") from exc
-    if not sites:
-        return {"keyword": body.keyword, "province": body.province, "requested_count": target_count, "discovered_urls": 0, "processed_websites": 0, "results": [], "warnings": ["No suitable websites found"]}
-    async with httpx.AsyncClient(timeout=httpx.Timeout(60, connect=10), follow_redirects=False) as client:
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_SITES)
-        tasks = [process_site(client, site, semaphore) for site in sites]
-        processed = await asyncio.gather(*tasks)
-    return {"keyword": body.keyword, "province": body.province, "requested_count": target_count,
-            "discovered_urls": len(sites), "processed_websites": len(processed),
-            "results": processed, "warnings": [r["error"] for r in processed if r.get("error")]}
