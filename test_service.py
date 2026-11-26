@@ -2,6 +2,8 @@
 """Live smoke test for the local API using real SearXNG and Firecrawl services."""
 import json
 import os
+import re
+from urllib.parse import urlsplit
 import sys
 import urllib.error
 import urllib.request
@@ -51,17 +53,34 @@ try:
     if status != 200 or not required.issubset(result) or not isinstance(result["results"], list):
         raise RuntimeError("Discovery response does not match the expected JSON structure")
 
+    if result["successful_websites"] != len(result["results"]):
+        raise RuntimeError("successful_websites does not match results length")
+
+    seen_numbers = set()
     print(f"Successful websites: {result['successful_websites']}")
     print(f"Unique mobile numbers: {result['total_unique_mobile_numbers']}")
     print(f"Completed search rounds: {result['completed_rounds']}")
     for website in result["results"]:
-        if not {"website_url", "mobile_numbers"}.issubset(website):
-            raise RuntimeError("A website result is missing required fields")
+        if not {"website_url", "mobile_numbers"}.issubset(website) or not website["mobile_numbers"]:
+            raise RuntimeError("A successful website result is missing its mobiles")
         print(f"\nWebsite: {website['website_url']}")
         for phone in website["mobile_numbers"]:
             if not {"number", "source_url"}.issubset(phone):
                 raise RuntimeError("A mobile number is missing its source URL")
-            print(f"  Mobile: {phone['number']} (source: {phone['source_url']})")
+            number = phone["number"]
+            source = urlsplit(phone["source_url"])
+            if not re.fullmatch(r"09\d{9}", number):
+                raise RuntimeError(f"Invalid or non-mobile number in response: {number}")
+            if number in seen_numbers:
+                raise RuntimeError(f"Duplicate mobile number in response: {number}")
+            if source.scheme not in {"http", "https"} or not source.hostname:
+                raise RuntimeError(f"Invalid source_url for {number}: {phone['source_url']}")
+            seen_numbers.add(number)
+            print(f"  Mobile: {number} (source: {phone['source_url']})")
+    if len(seen_numbers) != result["total_unique_mobile_numbers"]:
+        raise RuntimeError("total_unique_mobile_numbers does not match returned mobiles")
+    for warning in result.get("warnings", []):
+        print(f"Warning: {warning}")
     print("Live test: PASS")
 except Exception as exc:
     print(f"Live test: FAIL: {exc}", file=sys.stderr)

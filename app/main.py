@@ -128,13 +128,15 @@ async def search_sites(
                     params={"q": query, "format": "json", "language": "fa-IR", "pageno": page_no},
                 )
                 response.raise_for_status()
-                results = response.json().get("results", [])
-            except (httpx.HTTPError, ValueError) as exc:
-                if not sites and not excluded:
-                    raise RuntimeError(f"SearXNG request failed: {type(exc).__name__}") from exc
-                log.warning("SearXNG page %s in round %s failed (%s)", page_no, round_number, type(exc).__name__)
-                break
+                payload = response.json()
+                if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+                    raise ValueError("invalid SearXNG JSON response structure")
+                results = payload["results"]
+            except (httpx.HTTPError, ValueError, TypeError) as exc:
+                raise RuntimeError(f"SearXNG request failed: {type(exc).__name__}") from exc
             for item in results:
+                if not isinstance(item, dict):
+                    continue
                 normalized = normalize_url(str(item.get("url", "")))
                 if not normalized:
                     continue
@@ -155,7 +157,7 @@ def normalize_mobile(raw: str) -> str | None:
     digits = re.sub(r"\D", "", raw.translate(DIGITS))
     if digits.startswith("0098"):
         digits = digits[4:]
-    elif digits.startswith("98") and len(digits) == 12:
+    elif digits.startswith("98"):
         digits = digits[2:]
     if len(digits) == 10 and digits.startswith("9"):
         digits = "0" + digits
@@ -296,6 +298,7 @@ async def run_discovery(
     processed_domains: set[str] = set()
     registered_numbers: set[str] = set()
     results: list[dict] = []
+    warnings: list[str] = []
     completed_rounds = 0
 
     for round_number in range(1, MAX_SEARCH_ROUNDS + 1):
@@ -311,10 +314,12 @@ async def run_discovery(
                 excluded_domains=processed_domains,
                 round_number=round_number,
             )
-        except RuntimeError:
+        except RuntimeError as exc:
             if completed_rounds == 0:
                 raise
-            log.exception("SearXNG failed in round %s; returning collected results", round_number)
+            warning = f"SearXNG failed in round {round_number}: {exc}"
+            warnings.append(warning)
+            log.error("%s; returning results from completed rounds", warning)
             break
         completed_rounds = round_number
 
@@ -358,13 +363,16 @@ async def run_discovery(
         if len(results) >= target_count:
             break
 
-    return {
+    response = {
         "requested_count": target_count,
         "successful_websites": len(results),
         "total_unique_mobile_numbers": len(registered_numbers),
         "completed_rounds": completed_rounds,
         "results": results,
     }
+    if warnings:
+        response["warnings"] = warnings
+    return response
 
 
 @app.post("/v1/discover", dependencies=[Depends(require_key)])

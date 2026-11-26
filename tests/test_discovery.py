@@ -1,9 +1,11 @@
 import asyncio
 import math
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
-from app.main import extract_mobile_numbers, normalize_mobile, run_discovery
+import httpx
+
+from app.main import extract_mobile_numbers, normalize_mobile, run_discovery, search_sites
 
 
 class PhoneExtractionTests(unittest.TestCase):
@@ -14,13 +16,23 @@ class PhoneExtractionTests(unittest.TestCase):
 
     def test_country_prefix_and_without_prefix(self):
         examples = [
+            "09123456789",
             "9123456789",
             "+989123456789",
+            "+98 912 345 6789",
+            "+98 09123456789",
+            "+98 0912 345 6789",
             "00989123456789",
+            "0098 0912 345 6789",
             "989123456789",
-            "09123456789",
+            "98 09123456789",
+            "۰۹۱۲۳۴۵۶۷۸۹",
+            "٠٩١٢٣٤٥٦٧٨٩",
         ]
-        self.assertEqual({normalize_mobile(value) for value in examples}, {"09123456789"})
+        for value in examples:
+            with self.subTest(value=value):
+                self.assertEqual(normalize_mobile(value), "09123456789")
+                self.assertIn("09123456789", extract_mobile_numbers(value))
 
     def test_common_separators(self):
         examples = [
@@ -165,6 +177,117 @@ class DiscoveryAlgorithmTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["results"][0]["mobile_numbers"], [
             {"number": "09123456789", "source_url": source}
         ])
+
+
+    async def test_searxng_error_in_first_round_is_raised(self):
+        search = AsyncMock(side_effect=RuntimeError("SearXNG request failed: TimeoutException"))
+        with self.assertRaisesRegex(RuntimeError, "SearXNG request failed"):
+            await run_discovery("shop", "Iran", 1, search, AsyncMock())
+
+    async def test_round_two_search_error_preserves_round_one_results_and_warns(self):
+        async def search(_keyword, _province, _needed, excluded_domains, round_number):
+            if round_number == 1:
+                return [self.site("round-one.ir")]
+            raise RuntimeError("SearXNG request failed: HTTPStatusError")
+
+        async def process(_client, site, _semaphore):
+            return {"website_url": site["website_url"], "phones": {"09123456789": "https://round-one.ir/contact"}}
+
+        response = await run_discovery("shop", "Iran", 2, search, process)
+        self.assertEqual(response["successful_websites"], 1)
+        self.assertEqual(response["completed_rounds"], 1)
+        self.assertEqual(len(response["results"]), 1)
+        self.assertIn("SearXNG failed in round 2", response["warnings"][0])
+
+    async def test_round_three_search_error_preserves_prior_results_and_warns(self):
+        async def search(_keyword, _province, _needed, excluded_domains, round_number):
+            if round_number == 1:
+                return [self.site("round-one.ir")]
+            if round_number == 2:
+                return []
+            raise RuntimeError("SearXNG request failed: invalid JSON")
+
+        async def process(_client, site, _semaphore):
+            return {"website_url": site["website_url"], "phones": {"09123456789": "https://round-one.ir/contact"}}
+
+        response = await run_discovery("shop", "Iran", 2, search, process)
+        self.assertEqual(response["successful_websites"], 1)
+        self.assertEqual(response["completed_rounds"], 2)
+        self.assertEqual(len(response["results"]), 1)
+        self.assertIn("SearXNG failed in round 3", response["warnings"][0])
+
+    async def test_successful_empty_search_is_not_an_error(self):
+        search = AsyncMock(return_value=[])
+        response = await run_discovery("shop", "Iran", 1, search, AsyncMock())
+        self.assertEqual(response["completed_rounds"], 3)
+        self.assertEqual(response["results"], [])
+        self.assertNotIn("warnings", response)
+
+    async def test_successful_nonempty_search_is_processed(self):
+        search = AsyncMock(return_value=[self.site("found.ir")])
+
+        async def process(_client, site, _semaphore):
+            return {"website_url": site["website_url"], "phones": {"09123456789": "https://found.ir/contact"}}
+
+        response = await run_discovery("shop", "Iran", 1, search, process)
+        self.assertEqual(response["successful_websites"], 1)
+        self.assertEqual(response["results"][0]["website_url"], "https://found.ir/")
+
+    async def test_search_sites_raises_http_timeout_and_invalid_json_even_with_exclusions(self):
+        class FakeClient:
+            def __init__(self, behavior):
+                self.behavior = behavior
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def get(self, *args, **kwargs):
+                if isinstance(self.behavior, Exception):
+                    raise self.behavior
+                return self.behavior
+
+        request = httpx.Request("GET", "http://searx.test/search")
+        http_response = httpx.Response(503, request=request)
+        invalid_json = httpx.Response(200, text="not-json", request=request)
+        cases = [
+            httpx.TimeoutException("timed out"),
+            httpx.ConnectError("connection failed"),
+            http_response,
+            invalid_json,
+        ]
+        for behavior in cases:
+            with self.subTest(behavior=type(behavior).__name__):
+                with patch("app.main.httpx.AsyncClient", return_value=FakeClient(behavior)):
+                    with self.assertRaisesRegex(RuntimeError, "SearXNG request failed"):
+                        await search_sites("shop", "Iran", 1, excluded_domains={"previous.ir"})
+
+    async def test_search_sites_distinguishes_successful_empty_and_nonempty_results(self):
+        class FakeClient:
+            def __init__(self, response):
+                self.response = response
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def get(self, *args, **kwargs):
+                return self.response
+
+        request = httpx.Request("GET", "http://searx.test/search")
+        empty = httpx.Response(200, json={"results": []}, request=request)
+        with patch("app.main.httpx.AsyncClient", return_value=FakeClient(empty)):
+            self.assertEqual(await search_sites("shop", "Iran", 1), [])
+
+        nonempty = httpx.Response(200, json={"results": [{"url": "https://www.example.org/contact?utm_source=x"}]}, request=request)
+        with patch("app.main.httpx.AsyncClient", return_value=FakeClient(nonempty)):
+            sites = await search_sites("shop", "Iran", 1)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0]["url"], "https://example.org/contact")
 
     async def test_duplicate_phone_across_websites_is_only_returned_once(self):
         search = AsyncMock(return_value=[self.site("a.ir"), self.site("b.ir")])

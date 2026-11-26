@@ -53,7 +53,7 @@ Crawl limits are configurable through `MAX_CRAWL_PAGES`, `MAX_CRAWL_DEPTH`, `MAX
 }
 ```
 
-A valid response with zero matches has `successful_websites: 0` and `results: []`.
+A valid response with zero matches has `successful_websites: 0` and `results: []`. If SearXNG fails in round two or three, already collected results are returned with a `warnings` entry. A failure in round one returns HTTP 502.
 
 The operation is synchronous. Sites run three at a time by default. At `count=100`, worst-case duration may approach four hours. Use a long-running client worker or small counts for interactive requests.
 
