@@ -1,11 +1,12 @@
 import asyncio
+import asyncio
 import math
 import unittest
 from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from app.main import extract_mobile_numbers, normalize_mobile, run_discovery, search_sites
+from app.main import extract_mobile_numbers, firecrawl_crawl, normalize_mobile, process_site, run_discovery, search_sites
 
 
 class PhoneExtractionTests(unittest.TestCase):
@@ -64,6 +65,25 @@ class PhoneExtractionTests(unittest.TestCase):
 
     def test_longer_numeric_strings_do_not_yield_partial_mobile(self):
         self.assertEqual(extract_mobile_numbers("12309123456789123"), [])
+
+
+class FirecrawlFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_firecrawl_timeout_is_returned_as_a_site_error(self):
+        class TimeoutClient:
+            async def post(self, *args, **kwargs):
+                raise httpx.TimeoutException("Firecrawl timed out")
+
+        pages, error = await firecrawl_crawl(TimeoutClient(), {"url": "https://timeout.ir/", "website_url": "https://timeout.ir/"})
+        self.assertEqual(pages, [])
+        self.assertIn("TimeoutException", error)
+
+    async def test_firecrawl_failed_site_does_not_abort_other_discovery_work(self):
+        site = {"url": "https://failed.ir/", "website_url": "https://failed.ir/"}
+        with patch("app.main.firecrawl_crawl", new=AsyncMock(return_value=([], "Firecrawl job failed"))):
+            result = await process_site(object(), site, asyncio.Semaphore(1))
+        self.assertEqual(result["website_url"], "https://failed.ir/")
+        self.assertEqual(result["phones"], {})
+        self.assertEqual(result["error"], "Firecrawl job failed")
 
 
 class DiscoveryAlgorithmTests(unittest.IsolatedAsyncioTestCase):

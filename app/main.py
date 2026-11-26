@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -13,8 +14,12 @@ from math import ceil
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+
+from .job_manager import IdempotencyConflict, JobManager
+from .job_store import JobStore, TERMINAL
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("business_discovery")
@@ -29,8 +34,11 @@ MAX_CRAWL_DEPTH = int(os.getenv("MAX_CRAWL_DEPTH", "2"))
 MAX_CONCURRENT_SITES = int(os.getenv("MAX_CONCURRENT_SITES", "3"))
 MAX_SEARCH_ROUNDS = 3
 SEARCH_URL_FACTOR = 1.6
+MAX_SEARCH_PAGES = int(os.getenv("MAX_SEARCH_PAGES", "50"))
+JOB_DB_PATH = os.getenv("JOB_DB_PATH", "/opt/business-discovery/data/jobs.sqlite3")
+JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", str(7 * 24 * 60 * 60)))
+JOB_CLEANUP_INTERVAL = int(os.getenv("JOB_CLEANUP_INTERVAL", "3600"))
 
-# Mobile numbers only. Boundaries prevent extracting 11 digits from a longer number.
 MOBILE_RE = re.compile(
     r"(?<!\d)(?:(?:\+?98|0098)[\s().-]*)?0?9\d{2}[\s().-]*\d{3}[\s().-]*\d{4}(?!\d)"
 )
@@ -56,10 +64,35 @@ class DiscoverRequest(BaseModel):
 async def lifespan(app: FastAPI):
     if not API_KEY or len(API_KEY) < 32:
         raise RuntimeError("API_KEY must be configured as a random secret of at least 32 characters")
-    yield
+    store = JobStore(JOB_DB_PATH, retention_seconds=JOB_TTL_SECONDS)
+    manager = JobManager(
+        store=store,
+        search_fn=search_sites,
+        query_fn=search_query_for_round,
+        process_fn=process_site_in_background,
+        normalize_phone_fn=normalize_mobile,
+        max_concurrent_sites=MAX_CONCURRENT_SITES,
+        max_rounds=MAX_SEARCH_ROUNDS,
+        url_factor=SEARCH_URL_FACTOR,
+        max_search_pages=MAX_SEARCH_PAGES,
+        cleanup_interval=JOB_CLEANUP_INTERVAL,
+    )
+    await manager.start()
+    app.state.job_manager = manager
+    try:
+        yield
+    finally:
+        await manager.stop()
 
 
-app = FastAPI(title="Iran Business Contact Discovery", version="1.1.0", lifespan=lifespan)
+app = FastAPI(
+    title="Iran Business Contact Discovery",
+    version="2.0.0",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 
 async def require_key(authorization: str | None = Header(default=None)) -> None:
@@ -106,22 +139,40 @@ def homepage_url(url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, "/", "", ""))
 
 
+def search_query_for_round(keyword: str, province: str, round_number: int) -> str:
+    query = f"{keyword} {province} ایران"
+    if round_number == 2:
+        query += " شماره تماس"
+    elif round_number == 3:
+        query += " سایت رسمی تماس"
+    return query
+
+
 async def search_sites(
     keyword: str,
     province: str,
     needed: int,
     excluded_domains: set[str] | None = None,
     round_number: int = 1,
+    start_page: int = 1,
+    initial_sites: list[dict] | None = None,
+    page_callback=None,
+    max_pages: int | None = None,
 ) -> list[dict]:
     excluded = excluded_domains or set()
-    query = f"{keyword} {province} ایران"
-    if round_number == 2:
-        query += " شماره تماس"
-    elif round_number == 3:
-        query += " سایت رسمی تماس"
+    page_limit = max_pages if max_pages is not None else MAX_SEARCH_PAGES
+    query = search_query_for_round(keyword, province, round_number)
     sites: dict[str, dict] = {}
+    for site in initial_sites or []:
+        domain = domain_of(site.get("url", ""))
+        if domain and domain not in excluded:
+            sites.setdefault(domain, site)
+
+    if len(sites) >= needed:
+        return list(sites.values())[:needed]
+
     async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT, follow_redirects=True) as client:
-        for page_no in range(1, 9):
+        for page_no in range(start_page, page_limit + 1):
             try:
                 response = await client.get(
                     f"{SEARXNG_URL.rstrip('/')}/search",
@@ -131,10 +182,12 @@ async def search_sites(
                 payload = response.json()
                 if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
                     raise ValueError("invalid SearXNG JSON response structure")
-                results = payload["results"]
+                items = payload["results"]
             except (httpx.HTTPError, ValueError, TypeError) as exc:
                 raise RuntimeError(f"SearXNG request failed: {type(exc).__name__}") from exc
-            for item in results:
+
+            new_sites: list[dict] = []
+            for item in items:
                 if not isinstance(item, dict):
                     continue
                 normalized = normalize_url(str(item.get("url", "")))
@@ -143,12 +196,18 @@ async def search_sites(
                 domain = domain_of(normalized)
                 if domain in excluded or domain in sites:
                     continue
-                sites[domain] = {
+                site = {
                     "url": normalized,
                     "website_url": homepage_url(normalized),
                     "title": str(item.get("title", ""))[:300],
                 }
-            if len(sites) >= needed:
+                sites[domain] = site
+                new_sites.append(site)
+
+            exhausted = len(items) == 0
+            if page_callback:
+                await page_callback(page_no + 1, new_sites, exhausted)
+            if len(sites) >= needed or exhausted:
                 break
     return list(sites.values())[:needed]
 
@@ -171,6 +230,7 @@ def extract_mobile_numbers(content: str) -> list[str]:
 
 
 async def firecrawl_crawl(client: httpx.AsyncClient, site: dict) -> tuple[list[dict], str | None]:
+    job_id = None
     try:
         created = await client.post(
             f"{FIRECRAWL_URL.rstrip('/')}/v2/crawl",
@@ -215,7 +275,14 @@ async def firecrawl_crawl(client: httpx.AsyncClient, site: dict) -> tuple[list[d
         except httpx.HTTPError:
             log.warning("Could not cancel timed-out Firecrawl crawl")
         return pages, "Firecrawl crawl timed out"
-    except (httpx.HTTPError, ValueError) as exc:
+    except asyncio.CancelledError:
+        if job_id:
+            try:
+                await client.delete(f"{FIRECRAWL_URL.rstrip('/')}/v2/crawl/{job_id}", timeout=10)
+            except httpx.HTTPError:
+                log.warning("Could not cancel Firecrawl crawl after worker cancellation")
+        raise
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
         return [], f"Firecrawl request failed: {type(exc).__name__}"
 
 
@@ -250,8 +317,6 @@ async def process_site(client: httpx.AsyncClient, site: dict, semaphore: asyncio
         for number in extract_mobile_numbers(content):
             phones.setdefault(number, source)
 
-    # If the bounded crawl did not find any mobile, scrape up to three explicit
-    # contact/about links from the pages already collected.
     if not phones:
         candidates: list[str] = []
         for page in pages:
@@ -286,13 +351,13 @@ async def process_site(client: httpx.AsyncClient, site: dict, semaphore: asyncio
     return {"website_url": site["website_url"], "phones": phones, "error": error}
 
 
-async def run_discovery(
-    keyword: str,
-    province: str,
-    target_count: int,
-    search_fn=None,
-    process_fn=None,
-) -> dict:
+async def process_site_in_background(site: dict, semaphore: asyncio.Semaphore) -> dict:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60, connect=10), follow_redirects=False) as client:
+        return await process_site(client, site, semaphore)
+
+
+async def run_discovery(keyword: str, province: str, target_count: int, search_fn=None, process_fn=None) -> dict:
+    """Synchronous core retained for regression tests and non-API callers."""
     search_fn = search_fn or search_sites
     process_fn = process_fn or process_site
     processed_domains: set[str] = set()
@@ -307,13 +372,7 @@ async def run_discovery(
             break
         url_target = ceil(remaining * SEARCH_URL_FACTOR)
         try:
-            sites = await search_fn(
-                keyword,
-                province,
-                url_target,
-                excluded_domains=processed_domains,
-                round_number=round_number,
-            )
+            sites = await search_fn(keyword, province, url_target, excluded_domains=processed_domains, round_number=round_number)
         except RuntimeError as exc:
             if completed_rounds == 0:
                 raise
@@ -322,8 +381,7 @@ async def run_discovery(
             log.error("%s; returning results from completed rounds", warning)
             break
         completed_rounds = round_number
-
-        unique_sites: list[dict] = []
+        unique_sites = []
         for site in sites:
             normalized = normalize_url(str(site.get("url", "")))
             if not normalized:
@@ -333,10 +391,8 @@ async def run_discovery(
                 continue
             processed_domains.add(domain)
             unique_sites.append({**site, "url": normalized, "website_url": homepage_url(normalized)})
-
         if not unique_sites:
             continue
-
         async with httpx.AsyncClient(timeout=httpx.Timeout(60, connect=10), follow_redirects=False) as client:
             semaphore = asyncio.Semaphore(MAX_CONCURRENT_SITES)
             for offset in range(0, len(unique_sites), MAX_CONCURRENT_SITES):
@@ -345,16 +401,14 @@ async def run_discovery(
                 for site_result in batch_results:
                     if site_result.get("error"):
                         log.warning("Website processing issue: %s", site_result["error"])
-                    site_phones = site_result.get("phones") or {}
-                    new_numbers = [number for number in site_phones if number not in registered_numbers]
+                    phones = site_result.get("phones") or {}
+                    new_numbers = [number for number in phones if number not in registered_numbers]
                     if not new_numbers:
                         continue
                     website_result = {"website_url": site_result["website_url"], "mobile_numbers": []}
                     for number in new_numbers:
                         registered_numbers.add(number)
-                        website_result["mobile_numbers"].append(
-                            {"number": number, "source_url": site_phones[number]}
-                        )
+                        website_result["mobile_numbers"].append({"number": number, "source_url": phones[number]})
                     results.append(website_result)
                     if len(results) >= target_count:
                         break
@@ -362,7 +416,6 @@ async def run_discovery(
                     break
         if len(results) >= target_count:
             break
-
     response = {
         "requested_count": target_count,
         "successful_websites": len(results),
@@ -375,10 +428,105 @@ async def run_discovery(
     return response
 
 
-@app.post("/v1/discover", dependencies=[Depends(require_key)])
-async def discover(body: DiscoverRequest):
+def format_sse(event: dict) -> str:
+    data = json.dumps(event["data"], ensure_ascii=False, separators=(",", ":"))
+    return f"id: {event['id']}\nevent: {event['event']}\ndata: {data}\n\n"
+
+
+def get_job_manager(request: Request) -> JobManager:
+    return request.app.state.job_manager
+
+
+@app.post("/v1/discover", status_code=202, dependencies=[Depends(require_key)])
+async def create_discovery_job(
+    body: DiscoverRequest,
+    request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=200),
+):
+    manager = get_job_manager(request)
     try:
-        return await run_discovery(body.keyword, body.province, body.count)
-    except RuntimeError as exc:
-        log.error("Search failed: %s", exc)
-        raise HTTPException(status_code=502, detail="Search provider unavailable") from exc
+        job, created = manager.submit(body.keyword, body.province, body.count, idempotency_key=idempotency_key)
+    except IdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    job.update({
+        "created": created,
+        "status_url": f"/v1/jobs/{job['job_id']}",
+        "events_url": f"/v1/jobs/{job['job_id']}/events",
+        "result_url": f"/v1/jobs/{job['job_id']}/result",
+    })
+    return job
+
+
+@app.get("/v1/jobs/{job_id}/events", dependencies=[Depends(require_key)])
+async def stream_job_events(
+    job_id: str,
+    request: Request,
+    manager: JobManager = Depends(get_job_manager),
+    last_event_id_query: int | None = Query(default=None, alias="last_event_id", ge=0),
+):
+    record = manager.store.get(job_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Job not found or expired")
+    last_header = request.headers.get("last-event-id")
+    if last_event_id_query is not None:
+        cursor = last_event_id_query
+    elif last_header is not None:
+        try:
+            cursor = int(last_header)
+            if cursor < 0:
+                raise ValueError
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Last-Event-ID must be a non-negative integer") from exc
+    else:
+        cursor = 0
+
+    async def event_stream():
+        nonlocal cursor
+        heartbeat_at = time.monotonic()
+        while True:
+            if await request.is_disconnected():
+                return
+            events = manager.store.events_after(job_id, cursor)
+            if events:
+                for event in events:
+                    cursor = event["id"]
+                    yield format_sse(event)
+                continue
+            current = manager.store.get(job_id)
+            if current is None:
+                return
+            if current["status"] in TERMINAL and cursor >= current["last_event_id"]:
+                return
+            if time.monotonic() - heartbeat_at >= 15:
+                heartbeat_at = time.monotonic()
+                yield ": heartbeat\n\n"
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/v1/jobs/{job_id}/result", dependencies=[Depends(require_key)])
+async def get_job_result(job_id: str, request: Request):
+    manager = get_job_manager(request)
+    result = manager.final_result(job_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Job not found or expired")
+    if result["status"] not in TERMINAL:
+        raise HTTPException(status_code=409, detail={"status": result["status"], "status_url": f"/v1/jobs/{job_id}"})
+    return result
+
+
+@app.get("/v1/jobs/{job_id}", dependencies=[Depends(require_key)])
+async def get_job_status(job_id: str, request: Request):
+    status = get_job_manager(request).status(job_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Job not found or expired")
+    return status
