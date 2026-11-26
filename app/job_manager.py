@@ -10,8 +10,7 @@ import os
 import time
 import uuid
 from typing import Any, Awaitable, Callable
-
-import httpx
+from urllib.parse import urlsplit
 
 from .job_store import IdempotencyConflict, JobStore, TERMINAL
 
@@ -19,7 +18,7 @@ log = logging.getLogger("business_discovery.jobs")
 
 
 class JobManager:
-    """Persistent, single-instance job runner backed by SQLite."""
+    """Persistent URL-level discovery runner for one API process."""
 
     def __init__(
         self,
@@ -107,6 +106,7 @@ class JobManager:
         self.store.cleanup_expired()
         job_id = uuid.uuid4().hex
         state = {
+            "schema_version": 2,
             "job_id": job_id,
             "status": "queued",
             "keyword": keyword,
@@ -115,22 +115,25 @@ class JobManager:
             "current_round": 0,
             "total_rounds": self.max_rounds,
             "round_url_target": 0,
+            "discovered_page_count": 0,
+            "processed_page_count": 0,
+            "successful_page_count": 0,
+            "successful_page_urls": [],
             "discovered_in_round": 0,
             "processed_in_round": 0,
             "remaining_in_round": 0,
-            "successful_websites": 0,
-            "total_unique_mobile_numbers": 0,
             "current_stage": "queued",
-            "website_statuses": {},
+            "page_statuses": {},
             "errors": [],
             "warnings": [],
             "results": [],
-            "processed_domains": [],
+            "processed_urls": [],
             "registered_numbers": [],
             "pagination": {},
             "round_query": "",
-            "round_sites": [],
+            "round_pages": [],
             "round_search_complete": False,
+            "search_exhausted": False,
             "stop_after_round": False,
             "fail_after_round": False,
         }
@@ -146,6 +149,7 @@ class JobManager:
     def _public_state(self, record: dict) -> dict:
         state = record["state"]
         return {
+            "schema_version": 2,
             "job_id": record["job_id"],
             "status": record["status"],
             "created_at": record["created_at"],
@@ -154,13 +158,16 @@ class JobManager:
             "requested_count": state["requested_count"],
             "current_round": state["current_round"],
             "total_rounds": state["total_rounds"],
+            "discovered_page_count": state["discovered_page_count"],
+            "processed_page_count": state["processed_page_count"],
+            "successful_page_count": state["successful_page_count"],
             "discovered_in_round": state["discovered_in_round"],
             "processed_in_round": state["processed_in_round"],
             "remaining_in_round": state["remaining_in_round"],
-            "successful_websites": state["successful_websites"],
-            "total_unique_mobile_numbers": state["total_unique_mobile_numbers"],
+            "successful_results": len(state["results"]),
+            "total_unique_mobile_numbers": len(state["registered_numbers"]),
             "current_stage": state["current_stage"],
-            "website_statuses": state["website_statuses"],
+            "page_statuses": state["page_statuses"],
             "errors": state["errors"],
             "warnings": state["warnings"],
             "results": state["results"],
@@ -175,11 +182,15 @@ class JobManager:
         if status is None:
             return None
         return {
+            "schema_version": 2,
             "job_id": status["job_id"],
             "status": status["status"],
             "requested_count": status["requested_count"],
-            "successful_websites": status["successful_websites"],
+            "successful_results": status["successful_results"],
             "total_unique_mobile_numbers": status["total_unique_mobile_numbers"],
+            "discovered_page_count": status["discovered_page_count"],
+            "processed_page_count": status["processed_page_count"],
+            "successful_page_count": status["successful_page_count"],
             "completed_rounds": status["current_round"],
             "results": status["results"],
             "errors": status["errors"],
@@ -201,7 +212,7 @@ class JobManager:
 
                 if stage == "preparing" and state.get("resume_stage"):
                     state["current_stage"] = state.pop("resume_stage")
-                    self.store.save(job_id, state, event=("progress", self._round_progress(state)))
+                    self.store.save(job_id, state, event=("progress", self._summary(state)))
                     continue
                 if stage == "preparing" or state["current_round"] == 0:
                     self._begin_round(job_id, 1)
@@ -211,18 +222,19 @@ class JobManager:
                     continue
                 if stage == "round_completed":
                     if (
-                        state["successful_websites"] >= state["requested_count"]
+                        len(state["results"]) >= state["requested_count"]
                         or state["stop_after_round"]
                         or state["current_round"] >= self.max_rounds
                     ):
-                        final_status = "failed" if state["fail_after_round"] else "completed"
-                        self._finish(job_id, final_status)
+                        status = "failed" if state["fail_after_round"] and not state["results"] else "completed"
+                        self._finish(job_id, status)
                         return
                     self._begin_round(job_id, state["current_round"] + 1)
                     continue
                 if stage == "searching":
-                    search_error = await self._search_round(job_id)
-                    if search_error and self.store.get(job_id)["state"]["current_stage"] == "failed":
+                    await self._search_round(job_id)
+                    current = self.store.get(job_id)
+                    if current is None or current["status"] in TERMINAL:
                         return
                     continue
                 if stage == "processing":
@@ -244,7 +256,7 @@ class JobManager:
 
     def _begin_round(self, job_id: str, round_number: int) -> None:
         state = self.store.get(job_id)["state"]
-        remaining = state["requested_count"] - state["successful_websites"]
+        remaining = max(0, state["requested_count"] - len(state["results"]))
         query = self.query_fn(state["keyword"], state["province"], round_number)
         state.update({
             "current_round": round_number,
@@ -254,7 +266,7 @@ class JobManager:
             "remaining_in_round": 0,
             "current_stage": "searching",
             "round_query": query,
-            "round_sites": [],
+            "round_pages": [],
             "round_search_complete": False,
             "stop_after_round": False,
             "fail_after_round": False,
@@ -262,50 +274,50 @@ class JobManager:
         self.store.save(job_id, state, event=("round_started", {
             "current_round": round_number,
             "total_rounds": self.max_rounds,
-            "search_target": state["round_url_target"],
-            "remaining_successful_websites": remaining,
+            "round_url_target": state["round_url_target"],
+            "remaining_unique_numbers": remaining,
             "current_stage": "searching",
         }))
 
-    async def _search_round(self, job_id: str) -> str | None:
+    async def _search_round(self, job_id: str) -> None:
         state = self.store.get(job_id)["state"]
         query = state["round_query"]
         pagination = state["pagination"].get(query, {"next_page": 1, "exhausted": False})
-        initial_sites = list(state["round_sites"])
+        initial_pages = list(state["round_pages"])
         if pagination.get("exhausted") or pagination.get("next_page", 1) > self.max_search_pages:
             state["current_stage"] = "processing"
             state["round_search_complete"] = True
-            state["discovered_in_round"] = len(state["round_sites"])
-            state["remaining_in_round"] = self._remaining(state)
-            self.store.save(job_id, state, event=("search_completed", self._round_progress(state)))
-            return None
+            self._update_round_counts(state)
+            state["search_exhausted"] = True
+            self.store.save(job_id, state, event=("search_completed", self._summary(state)))
+            return
 
-        async def page_checkpoint(next_page: int, new_sites: list[dict], exhausted: bool) -> None:
+        async def page_checkpoint(next_page: int, new_pages: list[dict], exhausted: bool) -> None:
             current = self.store.get(job_id)["state"]
-            current_sites = current["round_sites"]
-            seen = {self._site_domain(site) for site in current_sites}
-            processed = set(current["processed_domains"])
-            slots = max(0, current["round_url_target"] - len(current_sites))
+            current_pages = current["round_pages"]
+            seen = {page["url"] for page in current_pages}
+            processed = set(current["processed_urls"])
+            slots = max(0, current["round_url_target"] - len(current_pages))
             added = 0
-            for site in new_sites:
-                domain = self._site_domain(site)
-                if not domain or domain in seen or domain in processed:
+            for page in new_pages:
+                page_url = str(page.get("url", ""))
+                if not page_url or page_url in seen or page_url in processed:
                     continue
                 if added >= slots:
                     break
-                seen.add(domain)
-                current_sites.append(site)
+                seen.add(page_url)
+                current_pages.append(page)
                 added += 1
-                current["website_statuses"].setdefault(site["website_url"], {
-                    "status": "pending", "round": current["current_round"], "error": None,
-                    "mobile_numbers_added": 0,
+                current["page_statuses"].setdefault(page_url, {
+                    "status": "pending", "round": current["current_round"], "error": None, "new_results_count": 0,
                 })
             current["pagination"][query] = {"next_page": next_page, "exhausted": exhausted}
-            current["round_sites"] = current_sites
-            current["discovered_in_round"] = len(current_sites)
-            current["remaining_in_round"] = self._remaining(current)
+            current["round_pages"] = current_pages
+            current["discovered_page_count"] += added
+            current["search_exhausted"] = current["search_exhausted"] or exhausted
+            self._update_round_counts(current)
             self.store.save(job_id, current, event=("progress", {
-                **self._round_progress(current), "search_page_consumed": next_page - 1,
+                **self._summary(current), "search_page_consumed": next_page - 1,
             }))
 
         try:
@@ -313,10 +325,10 @@ class JobManager:
                 state["keyword"],
                 state["province"],
                 state["round_url_target"],
-                excluded_domains=set(state["processed_domains"]),
+                excluded_urls=set(state["processed_urls"]),
                 round_number=state["current_round"],
                 start_page=int(pagination.get("next_page", 1)),
-                initial_sites=initial_sites,
+                initial_sites=initial_pages,
                 page_callback=page_checkpoint,
                 max_pages=self.max_search_pages,
             )
@@ -327,70 +339,64 @@ class JobManager:
             current["warnings"].append(warning)
             current["stop_after_round"] = True
             current["fail_after_round"] = current["current_round"] == 1
-            if current["fail_after_round"] and not current["round_sites"] and not current["results"]:
+            if current["fail_after_round"] and not current["round_pages"] and not current["results"]:
                 current["current_stage"] = "failed"
                 self.store.save(job_id, current, status="failed", event=("job_failed", self._summary(current, error=str(exc))))
-                return str(exc)
+                return
             current["current_stage"] = "processing"
             current["round_search_complete"] = True
-            current["discovered_in_round"] = len(current["round_sites"])
-            current["remaining_in_round"] = self._remaining(current)
+            self._update_round_counts(current)
             self.store.save(job_id, current, event=("warning", {
                 "message": str(exc), "current_round": current["current_round"],
-                "preserved_successful_websites": current["successful_websites"],
+                "preserved_result_count": len(current["results"]), **self._summary(current),
             }))
-            return str(exc)
+            return
 
         current = self.store.get(job_id)["state"]
         current["current_stage"] = "processing"
         current["round_search_complete"] = True
-        current["discovered_in_round"] = len(current["round_sites"])
-        current["remaining_in_round"] = self._remaining(current)
-        self.store.save(job_id, current, event=("search_completed", self._round_progress(current)))
-        return None
+        pagination_state = current["pagination"].get(query, {})
+        current["search_exhausted"] = current["search_exhausted"] or bool(pagination_state.get("exhausted"))
+        self._update_round_counts(current)
+        self.store.save(job_id, current, event=("search_completed", self._summary(current)))
 
     async def _process_round(self, job_id: str) -> None:
-        record = self.store.get(job_id)
-        state = record["state"]
-        round_number = state["current_round"]
-        round_sites = list(state["round_sites"])
-        statuses = state["website_statuses"]
-        pending = [site for site in round_sites if statuses.get(site["website_url"], {}).get("status") == "pending"]
-
+        state = self.store.get(job_id)["state"]
+        round_pages = list(state["round_pages"])
+        statuses = state["page_statuses"]
+        pending = [page for page in round_pages if statuses.get(page["url"], {}).get("status") == "pending"]
         if not pending:
             self._complete_round(job_id)
             return
 
         for offset in range(0, len(pending), self.max_concurrent_sites):
             batch = pending[offset : offset + self.max_concurrent_sites]
-            state = self.store.get(job_id)["state"]
-            for site in batch:
-                website_url = site["website_url"]
-                status_info = state["website_statuses"].setdefault(website_url, {})
-                status_info.update({"status": "processing", "round": round_number, "error": None})
-                domain = self._site_domain(site)
-                if domain and domain not in state["processed_domains"]:
-                    state["processed_domains"].append(domain)
-                state["remaining_in_round"] = self._remaining(state)
-                self.store.save(job_id, state, event=("website_started", {
-                    "website_url": website_url, **self._round_progress(state),
-                }))
+            for page in batch:
                 state = self.store.get(job_id)["state"]
+                page_url = page["url"]
+                status = state["page_statuses"].setdefault(page_url, {})
+                status.update({"status": "processing", "round": state["current_round"], "error": None})
+                if page_url not in state["processed_urls"]:
+                    state["processed_urls"].append(page_url)
+                self._update_round_counts(state)
+                self.store.save(job_id, state, event=("page_started", {
+                    "page_url": page_url, "website_url": page.get("website_url"), **self._summary(state),
+                }))
 
-            async def process_one(site: dict) -> tuple[dict, dict]:
+            async def process_one(page: dict) -> tuple[dict, dict]:
                 try:
-                    result = await self.process_fn(site, self.site_semaphore)
-                    return site, result
+                    result = await self.process_fn(page, self.site_semaphore)
+                    return page, result
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    return site, {"website_url": site["website_url"], "phones": {}, "error": str(exc)[:500]}
+                    return page, {"page_url": page["url"], "pages": [], "error": str(exc)[:500]}
 
-            tasks = [asyncio.create_task(process_one(site)) for site in batch]
+            tasks = [asyncio.create_task(process_one(page)) for page in batch]
             target_reached = False
             for completed in asyncio.as_completed(tasks):
-                site, result = await completed
-                target_reached = self._record_website(job_id, site, result)
+                page, page_result = await completed
+                target_reached = self._record_page(job_id, page, page_result)
                 if target_reached:
                     break
 
@@ -399,124 +405,156 @@ class JobManager:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
-                self._skip_remaining_round_sites(job_id)
+                self._skip_remaining_round_pages(job_id)
                 break
-
         self._complete_round(job_id)
 
-    def _record_website(self, job_id: str, site: dict, site_result: dict) -> bool:
+    def _record_page(self, job_id: str, candidate: dict, page_result: dict) -> bool:
         state = self.store.get(job_id)["state"]
-        website_url = site["website_url"]
-        error = site_result.get("error")
-        phones = site_result.get("phones") or {}
-        new_numbers: list[tuple[str, str]] = []
-        registered = set(state["registered_numbers"])
-        for candidate, source in phones.items():
-            number = self.normalize_phone_fn(str(candidate))
-            if number and number not in registered:
-                registered.add(number)
-                new_numbers.append((number, str(source)))
-
-        info = state["website_statuses"].setdefault(website_url, {"round": state["current_round"]})
-        info["status"] = "failed" if error and not phones else "completed"
-        info["error"] = str(error) if error else None
-        info["mobile_numbers_added"] = len(new_numbers)
-        state["processed_in_round"] = sum(
-            1 for value in state["website_statuses"].values()
-            if value.get("round") == state["current_round"] and value.get("status") in {"completed", "failed"}
-        )
-        state["remaining_in_round"] = self._remaining(state)
+        candidate_url = candidate["url"]
+        error = page_result.get("error")
+        added = 0
         if error:
-            warning = {"website_url": website_url, "round": state["current_round"], "message": str(error)}
+            warning = {"page_url": candidate_url, "round": state["current_round"], "message": str(error)}
             state["errors"].append(warning)
             state["warnings"].append(warning)
             self.store.save(job_id, state, event=("warning", warning))
             state = self.store.get(job_id)["state"]
-            info = state["website_statuses"][website_url]
 
-        result = None
-        if new_numbers:
-            registered = set(state["registered_numbers"])
-            phones_out = []
-            for number, source in new_numbers:
-                if number in registered:
+        pages = page_result.get("pages") or []
+        # Transitional adapter for test/custom processors that still return the old phone mapping.
+        if not pages and isinstance(page_result.get("phones"), dict):
+            source = candidate_url
+            pages = [{
+                "source_url": source,
+                "website_url": candidate.get("website_url"),
+                "page_title": "",
+                "page_description": "",
+                "numbers": list(page_result["phones"]),
+                "phone_sources": page_result["phones"],
+            }]
+
+        for page_data in sorted(pages, key=lambda item: str(item.get("source_url", ""))):
+            source_url = str(page_data.get("source_url") or candidate_url)
+            parts = urlsplit(source_url)
+            if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
+                continue
+            website_url = str(page_data.get("website_url") or candidate.get("website_url") or f"{parts.scheme}://{parts.netloc}/")
+            for raw_number in sorted(set(page_data.get("numbers") or [])):
+                number = self.normalize_phone_fn(str(raw_number))
+                current = self.store.get(job_id)["state"]
+                if not number or number in current["registered_numbers"] or len(current["results"]) >= current["requested_count"]:
                     continue
-                registered.add(number)
-                phones_out.append({"number": number, "source_url": source})
-            if phones_out:
-                state["registered_numbers"] = sorted(registered)
-                result = {"website_url": website_url, "mobile_numbers": phones_out}
-                state["results"].append(result)
-                state["successful_websites"] = len(state["results"])
-                state["total_unique_mobile_numbers"] = len(state["registered_numbers"])
+                phones = page_data.get("phone_sources") or {}
+                record = {
+                    "number": number,
+                    "source_url": str(phones.get(number) or source_url),
+                    "website_url": website_url,
+                    "page_title": str(page_data.get("page_title") or ""),
+                    "page_description": str(page_data.get("page_description") or ""),
+                }
+                current["registered_numbers"].append(number)
+                current["registered_numbers"].sort()
+                current["results"].append(record)
+                if candidate_url not in current["successful_page_urls"]:
+                    current["successful_page_urls"].append(candidate_url)
+                    current["successful_page_count"] = len(current["successful_page_urls"])
+                added += 1
+                self.store.save(job_id, current, event=("result_found", {
+                    "result": record,
+                    "successful_results": len(current["results"]),
+                    "total_unique_mobile_numbers": len(current["registered_numbers"]),
+                    "requested_count": current["requested_count"],
+                }))
 
-        info["mobile_numbers_added"] = len(result["mobile_numbers"]) if result else 0
-        status = info["status"]
-        data = {"website_url": website_url, "status": status, **self._round_progress(state)}
-        if error:
-            data["error"] = str(error)
-        if result:
-            data["result"] = result
-        self.store.save(job_id, state, event=("website_completed", data))
-        self.store.save(job_id, self.store.get(job_id)["state"], event=("progress", self._round_progress(self.store.get(job_id)["state"])))
-        current = self.store.get(job_id)["state"]
-        return current["successful_websites"] >= current["requested_count"]
-
-    def _skip_remaining_round_sites(self, job_id: str) -> None:
         state = self.store.get(job_id)["state"]
-        for site in state["round_sites"]:
-            info = state["website_statuses"].get(site["website_url"], {})
+        info = state["page_statuses"].setdefault(candidate_url, {})
+        info["status"] = "failed" if error and added == 0 else "completed"
+        info["error"] = str(error) if error else None
+        info["new_results_count"] = added
+        state["processed_page_count"] += 1
+        state["processed_in_round"] += 1
+        self._update_round_counts(state)
+        self.store.save(job_id, state, event=("page_completed", {
+            "page_url": candidate_url,
+            "website_url": candidate.get("website_url"),
+            "status": info["status"],
+            "new_results_count": added,
+            "processed_page_count": state["processed_page_count"],
+            "successful_page_count": state["successful_page_count"],
+            "successful_results": len(state["results"]),
+            "requested_count": state["requested_count"],
+            "error": str(error) if error else None,
+        }))
+        return len(self.store.get(job_id)["state"]["results"]) >= self.store.get(job_id)["state"]["requested_count"]
+
+    def _skip_remaining_round_pages(self, job_id: str) -> None:
+        state = self.store.get(job_id)["state"]
+        for page in state["round_pages"]:
+            info = state["page_statuses"].get(page["url"], {})
             if info.get("status") in {"pending", "processing"}:
                 info["status"] = "skipped"
-                info["reason"] = "requested_success_count_reached"
+                info["reason"] = "requested_result_count_reached"
         state["remaining_in_round"] = 0
         state["current_stage"] = "goal_reached"
-        self.store.save(job_id, state, event=("progress", self._round_progress(state)))
+        self.store.save(job_id, state, event=("progress", self._summary(state)))
 
     def _complete_round(self, job_id: str) -> None:
         state = self.store.get(job_id)["state"]
         state["current_stage"] = "round_completed"
-        state["remaining_in_round"] = self._remaining(state)
-        self.store.save(job_id, state, event=("round_completed", self._round_progress(state)))
+        self._update_round_counts(state)
+        self.store.save(job_id, state, event=("round_completed", self._summary(state)))
 
     def _finish(self, job_id: str, status: str) -> None:
         state = self.store.get(job_id)["state"]
+        search_finished = state["current_round"] >= self.max_rounds or state["search_exhausted"]
+        has_exhaustion_note = any("exhausted before the requested" in item.get("message", "") for item in state["warnings"])
+        if (
+            status == "completed"
+            and len(state["results"]) < state["requested_count"]
+            and search_finished
+            and not state["stop_after_round"]
+            and not has_exhaustion_note
+        ):
+            state["warnings"].append({
+                "message": "Available search results were exhausted before the requested unique mobile count was reached.",
+            })
         state["status"] = status
         state["current_stage"] = status
         event_type = "job_failed" if status == "failed" else "job_completed"
         self.store.save(job_id, state, status=status, event=(event_type, self._summary(state)))
 
     @staticmethod
-    def _site_domain(site: dict) -> str:
-        from urllib.parse import urlsplit
-        return (urlsplit(site.get("url", "")).hostname or "").lower().removeprefix("www.")
-
-    @staticmethod
-    def _remaining(state: dict) -> int:
-        return sum(
-            1 for site in state.get("round_sites", [])
-            if state.get("website_statuses", {}).get(site["website_url"], {}).get("status") in {"pending", "processing"}
+    def _update_round_counts(state: dict) -> None:
+        state["discovered_in_round"] = len(state.get("round_pages", []))
+        state["remaining_in_round"] = sum(
+            1 for page in state.get("round_pages", [])
+            if state.get("page_statuses", {}).get(page["url"], {}).get("status") in {"pending", "processing"}
         )
 
     @staticmethod
-    def _round_progress(state: dict) -> dict:
-        return {
+    def _summary(state: dict, error: str | None = None) -> dict:
+        data = {
+            "schema_version": 2,
             "status": state["status"],
             "current_round": state["current_round"],
             "total_rounds": state["total_rounds"],
+            "discovered_page_count": state["discovered_page_count"],
+            "processed_page_count": state["processed_page_count"],
+            "successful_page_count": state["successful_page_count"],
             "discovered_in_round": state["discovered_in_round"],
             "processed_in_round": state["processed_in_round"],
             "remaining_in_round": state["remaining_in_round"],
-            "successful_websites": state["successful_websites"],
-            "total_unique_mobile_numbers": state["total_unique_mobile_numbers"],
+            "successful_results": len(state["results"]),
+            "total_unique_mobile_numbers": len(state["registered_numbers"]),
+            "requested_count": state["requested_count"],
             "current_stage": state["current_stage"],
+            "results": state["results"],
         }
-
-    def _summary(self, state: dict, error: str | None = None) -> dict:
-        data = self._round_progress(state)
-        data.update({"job_id": state.get("job_id"), "requested_count": state["requested_count"], "results": state["results"]})
         if error:
             data["error"] = error
         if state.get("warnings"):
             data["warnings"] = state["warnings"]
+        if state.get("errors"):
+            data["errors"] = state["errors"]
         return data

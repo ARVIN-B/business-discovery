@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live end-to-end smoke test against this host's real SearXNG and Firecrawl."""
+"""Live smoke test for the v2 flat-result API contract."""
 import json
 import os
 import re
@@ -12,6 +12,8 @@ from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 BASE_URL = os.getenv("TEST_BASE_URL", "http://127.0.0.1:8091").rstrip("/")
+TEST_KEYWORD = os.getenv("TEST_KEYWORD", "رستوران")
+TEST_PROVINCE = os.getenv("TEST_PROVINCE", "اصفهان")
 TEST_COUNT = int(os.getenv("TEST_COUNT", "1"))
 JOB_TIMEOUT = int(os.getenv("TEST_JOB_TIMEOUT_SECONDS", "3600"))
 ENV_FILE = Path("/opt/business-discovery/.env")
@@ -72,9 +74,29 @@ def read_sse(url, headers, timeout):
     return events
 
 
+def validate_result(record):
+    required = {"number", "source_url", "website_url", "page_title", "page_description"}
+    if not isinstance(record, dict) or set(record) != required:
+        raise RuntimeError("Each result must have the flat schema_version=2 record fields")
+    if not re.fullmatch(r"09\d{9}", record["number"]):
+        raise RuntimeError(f"Invalid or non-mobile number: {record['number']}")
+    source = urlsplit(record["source_url"])
+    website = urlsplit(record["website_url"])
+    if source.scheme not in {"http", "https"} or not source.hostname:
+        raise RuntimeError(f"Invalid source_url: {record['source_url']}")
+    if website.scheme not in {"http", "https"} or not website.hostname:
+        raise RuntimeError(f"Invalid website_url: {record['website_url']}")
+    if source.scheme != website.scheme or source.hostname != website.hostname or source.port != website.port:
+        raise RuntimeError("website_url must be the root URL corresponding to source_url")
+    if website.path not in {"", "/"} or website.query or website.fragment:
+        raise RuntimeError("website_url must contain only the root website origin")
+
+
 def main():
-    if TEST_COUNT < 1 or TEST_COUNT > 100:
+    if not 1 <= TEST_COUNT <= 100:
         raise RuntimeError("TEST_COUNT must be between 1 and 100")
+    if JOB_TIMEOUT < 1:
+        raise RuntimeError("TEST_JOB_TIMEOUT_SECONDS must be positive")
     key = read_key()
     auth = {"Authorization": f"Bearer {key}"}
 
@@ -85,16 +107,16 @@ def main():
 
     status, created = request(
         BASE_URL + "/v1/discover",
-        payload={"keyword": "رستوران", "province": "اصفهان", "count": TEST_COUNT},
-        headers={**auth, "Content-Type": "application/json", "Idempotency-Key": "live-smoke-" + secrets.token_hex(12)},
+        payload={"keyword": TEST_KEYWORD, "province": TEST_PROVINCE, "count": TEST_COUNT},
+        headers={**auth, "Content-Type": "application/json", "Idempotency-Key": "live-v2-" + secrets.token_hex(12)},
         timeout=15,
     )
-    if status != 202 or not isinstance(created, dict):
-        raise RuntimeError(f"Job creation failed: HTTP {status}, body={created}")
+    if status != 202 or not isinstance(created, dict) or created.get("schema_version") != 2:
+        raise RuntimeError(f"Job creation failed or schema version is not 2: HTTP {status}, body={created}")
     job_id = created.get("job_id")
-    if not job_id or created.get("status_url") is None or created.get("events_url") is None:
-        raise RuntimeError("202 response omitted the job ID or endpoint links")
-    print(f"Job accepted: {job_id} (initial status: {created.get('status')})")
+    if not job_id or not all(created.get(key) for key in ("status_url", "events_url", "result_url")):
+        raise RuntimeError("202 response omitted job links")
+    print(f"Job accepted: {job_id} (status={created.get('status')})")
 
     status_url = urljoin(BASE_URL + "/", created["status_url"])
     events_url = urljoin(BASE_URL + "/", created["events_url"])
@@ -102,67 +124,65 @@ def main():
     deadline = time.monotonic() + JOB_TIMEOUT
     while True:
         if time.monotonic() >= deadline:
-            raise RuntimeError(f"Job {job_id} did not finish within {JOB_TIMEOUT}s")
-        http_status, job = request(status_url, headers=auth, timeout=30)
-        if http_status != 200 or not isinstance(job, dict):
-            raise RuntimeError(f"Status endpoint returned an invalid response: HTTP {http_status}")
+            raise RuntimeError(f"Job did not finish within {JOB_TIMEOUT}s")
+        status, job = request(status_url, headers=auth, timeout=30)
+        if status != 200 or job.get("schema_version") != 2:
+            raise RuntimeError("Status endpoint returned an invalid response")
         if job.get("status") in {"completed", "failed"}:
             break
         time.sleep(1)
-
-    discovered = len(job.get("website_statuses", {}))
-    processed = sum(1 for item in job.get("website_statuses", {}).values() if item.get("status") in {"completed", "failed", "skipped"})
-    print(f"Terminal status: {job['status']} — round {job.get('current_round')}/{job.get('total_rounds')}")
-    print(f"Websites discovered: {discovered}; processed: {processed}; successful: {job.get('successful_websites')}")
-    if job["status"] == "failed":
+    print(
+        "Pages: discovered={discovered}, processed={processed}, successful={successful}; results={results}/{target}".format(
+            discovered=job["discovered_page_count"], processed=job["processed_page_count"],
+            successful=job["successful_page_count"], results=job["successful_results"], target=job["requested_count"],
+        )
+    )
+    if job["status"] != "completed":
         raise RuntimeError(f"Discovery job failed: {job.get('errors')}")
 
-    http_status, result = request(result_url, headers=auth, timeout=30)
-    required = {"job_id", "status", "requested_count", "successful_websites", "total_unique_mobile_numbers", "completed_rounds", "results"}
-    if http_status != 200 or not isinstance(result, dict) or not required.issubset(result):
+    status, final = request(result_url, headers=auth, timeout=30)
+    required = {
+        "schema_version", "job_id", "status", "requested_count", "successful_results",
+        "total_unique_mobile_numbers", "discovered_page_count", "processed_page_count",
+        "successful_page_count", "completed_rounds", "results", "errors", "warnings",
+    }
+    if status != 200 or not isinstance(final, dict) or not required.issubset(final):
         raise RuntimeError("Final-result endpoint returned an invalid JSON structure")
-    if result["job_id"] != job_id or result["status"] != "completed":
+    if final["schema_version"] != 2 or final["job_id"] != job_id or final["status"] != "completed":
         raise RuntimeError("Final result does not match the completed job")
-    if result["successful_websites"] != len(result["results"]):
-        raise RuntimeError("successful_websites does not match results length")
+    count = len(final["results"])
+    if not (final["successful_results"] == final["total_unique_mobile_numbers"] == count):
+        raise RuntimeError("Unique result counters do not match the flat result array")
+    if final["successful_results"] > final["requested_count"]:
+        raise RuntimeError("The API returned more unique results than requested")
 
-    seen_numbers = set()
-    print(f"Unique Iranian mobile numbers: {result['total_unique_mobile_numbers']}")
-    print(f"Completed search rounds: {result['completed_rounds']}")
-    for website in result["results"]:
-        if not isinstance(website, dict) or not {"website_url", "mobile_numbers"}.issubset(website):
-            raise RuntimeError("Website result is missing its URL or mobile list")
-        print(f"\nWebsite: {website['website_url']}")
-        for phone in website["mobile_numbers"]:
-            if not {"number", "source_url"}.issubset(phone):
-                raise RuntimeError("A mobile result is missing its source page URL")
-            number = phone["number"]
-            source = urlsplit(phone["source_url"])
-            if not re.fullmatch(r"09\d{9}", number):
-                raise RuntimeError(f"Invalid Iranian mobile number: {number}")
-            if number in seen_numbers:
-                raise RuntimeError(f"Duplicate mobile number in final result: {number}")
-            if source.scheme not in {"http", "https"} or not source.hostname:
-                raise RuntimeError(f"Invalid source URL for {number}: {phone['source_url']}")
-            seen_numbers.add(number)
-            print(f"  {number} — source: {phone['source_url']}")
-    if len(seen_numbers) != result["total_unique_mobile_numbers"]:
-        raise RuntimeError("Number of returned unique mobiles does not match the total")
+    seen = set()
+    print(f"Unique mobile records: {count}")
+    for index, record in enumerate(final["results"], start=1):
+        validate_result(record)
+        if record["number"] in seen:
+            raise RuntimeError(f"Duplicate mobile number: {record['number']}")
+        seen.add(record["number"])
+        print(f"\n[{index}] Mobile: {record['number']}")
+        print(f"    Page title: {record['page_title']}")
+        print(f"    Source URL: {record['source_url']}")
+        print(f"    Website: {record['website_url']}")
 
-    # Replay the durable event log after completion and verify IDs/order.
     events = read_sse(events_url, auth, timeout=60)
-    event_ids = [event.get("id") for event in events]
-    if not events or any(event_id is None for event_id in event_ids):
-        raise RuntimeError("SSE replay returned no events or an event without an ID")
-    if event_ids != sorted(set(event_ids)):
-        raise RuntimeError("SSE event IDs are not strictly increasing")
+    ids = [event.get("id") for event in events]
+    if not events or any(value is None for value in ids) or ids != sorted(set(ids)):
+        raise RuntimeError("SSE event IDs are missing, duplicated, or out of order")
     event_names = [event.get("event") for event in events]
     if event_names[0] != "job_started" or event_names[-1] != "job_completed":
-        raise RuntimeError("SSE replay is missing the expected job lifecycle events")
-    if any(event.get("event") == "website_completed" and event.get("data", {}).get("result") for event in events):
-        print("SSE: per-website results replayed")
-    print(f"SSE: replayed {len(events)} ordered events (IDs {event_ids[0]}–{event_ids[-1]})")
-    for warning in result.get("warnings", []):
+        raise RuntimeError("SSE lifecycle events are incomplete")
+    streamed = [event["data"].get("result") for event in events if event.get("event") == "result_found"]
+    if streamed != final["results"]:
+        raise RuntimeError("result_found events do not reproduce the final flat results")
+    page_events = [event for event in events if event.get("event") == "page_completed"]
+    if any("page_url" not in event["data"] or "website_url" not in event["data"] for event in page_events):
+        raise RuntimeError("A page_completed event is missing URL-level identity")
+    print(f"SSE: {len(streamed)} result_found events, {len(page_events)} page_completed events, ordered IDs {ids[0]}–{ids[-1]}")
+    for warning in final["warnings"]:
         print(f"Warning: {warning}")
     print("Live integration test: PASS")
 

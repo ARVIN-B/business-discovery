@@ -1,149 +1,159 @@
 # Business Discovery API
 
-Independent FastAPI service that searches the local SearXNG instance and uses the existing Firecrawl service to find unique Iranian mobile numbers. Discovery runs as a durable job: the request returns immediately, status/results are persisted in SQLite, and completed website results are available through polling or Server-Sent Events (SSE).
+Independent FastAPI service that searches local SearXNG and uses the existing Firecrawl service to discover Iranian mobile numbers. Discovery runs as a durable job and publishes each newly accepted unique mobile number over SSE as soon as its page-processing task completes.
 
-## Runtime and deployment
+## Runtime
 
 - Application: `/opt/business-discovery`
-- Environment: `/opt/business-discovery/.env` (root-owned, mode `0600`)
 - API listener: `http://127.0.0.1:8091` (loopback only)
-- Health: `GET /health` (no authentication)
+- Health: `GET /health`
 - SearXNG: `http://127.0.0.1:8889`
 - Firecrawl: `http://127.0.0.1:3002`
-- Job database: `/opt/business-discovery/data/jobs.sqlite3` (SQLite WAL; private to the service account)
-- Process: `systemctl status|restart business-discovery`
+- SQLite job/event store: `/opt/business-discovery/data/jobs.sqlite3`
+- Service: `business-discovery.service`
 - Logs: `journalctl -u business-discovery`
-- Local SSE proxy template: `deploy/nginx-business-discovery.conf.example` (not enabled)
 
-The service must run as one Uvicorn worker. A process lock prevents a second worker or service instance from consuming the same SQLite job queue. On restart, queued/running jobs are recovered from persisted state. This is a single-host, single-instance design; SQLite is not intended for multi-host deployment. Job records and events expire after seven days by default.
+The API requires Bearer authentication on `/v1`. It uses one Uvicorn worker and a process lock on the SQLite file. Job state and events survive application restart. The database retains records for seven days by default. This is a single-host design, not a multi-instance queue.
 
-No public HTTPS endpoint is enabled. The current host name is not a usable public DNS name and port 443 has no trusted TLS listener. Keep port 8091 private. To enable the Nginx template, provide a DNS hostname controlled by you that resolves publicly to `195.248.240.152`, and arrange a trusted TLS certificate (for example, ACME HTTP-01 with port 80 reachable). Do not send Chabokan requests over public HTTP.
+## URL-level discovery
 
-## Configuration
+Every normalized full URL is an independent search candidate. Multiple listing, product, or seller pages under the same domain are not collapsed together. Tracking parameters such as `utm_*`, `fbclid`, and `gclid` are removed while listing IDs and meaningful query parameters are kept. Previously processed full URLs are excluded on later rounds; other pages on the same domain remain eligible.
 
-The systemd unit loads `.env`. Never put the API key in source control or include it in logs or requests other than the Authorization header.
+Firecrawl may return several crawled pages for one candidate URL. Each extracted mobile number is associated with the actual normalized page URL and metadata returned for that page. `website_url` is the root origin for secondary display; `source_url` is the primary clickable result. The API does not infer names or descriptions. Missing metadata is an empty string.
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `API_KEY` | required | Bearer token, at least 32 characters |
-| `SEARXNG_URL` | `http://127.0.0.1:8889` | Internal SearXNG endpoint |
-| `FIRECRAWL_URL` | `http://127.0.0.1:3002` | Internal Firecrawl endpoint |
-| `SEARCH_TIMEOUT` | `20` | Search request timeout, seconds |
-| `MAX_SEARCH_PAGES` | `50` | Maximum SearXNG pages per exact query |
-| `CRAWL_TIMEOUT` | `240` | Firecrawl crawl deadline, seconds |
-| `MAX_CRAWL_PAGES` | `10` | Maximum crawl pages per website |
-| `MAX_CRAWL_DEPTH` | `2` | Maximum crawl depth |
-| `MAX_CONCURRENT_SITES` | `3` | Website processing concurrency |
-| `JOB_DB_PATH` | `/opt/business-discovery/data/jobs.sqlite3` | Persistent job/event database |
-| `JOB_TTL_SECONDS` | `604800` | Job/event retention (seven days) |
-| `JOB_CLEANUP_INTERVAL` | `3600` | Expiration cleanup interval, seconds |
-| `LOG_LEVEL` | `INFO` | Application log level |
+`count` means the target number of unique valid Iranian mobile numbers. It does not mean websites, domains, or candidate pages. Numbers are normalized to `09xxxxxxxxx`, deduplicated across the whole job, and limited to the first valid source encountered. One source page can produce multiple flat result records. Concurrent page tasks cannot add more results than requested.
 
-## API workflow
+## API workflow (schema version 2)
 
-Every endpoint under `/v1` requires `Authorization: Bearer <API_KEY>`. The API docs and OpenAPI routes are disabled. `count` remains the target number of successful unique websites (a website is successful only when it adds at least one new valid mobile number), not a number of phone numbers.
+All `/v1` requests require:
 
-### 1. Create a job
+```http
+Authorization: Bearer <API_KEY>
+```
+
+### Create a job
 
 ```http
 POST /v1/discover
-Authorization: Bearer <API_KEY>
-Idempotency-Key: optional-client-generated-key
 Content-Type: application/json
+Idempotency-Key: optional-client-generated-key
 ```
 
 ```json
-{"keyword":"رستوران","province":"اصفهان","count":10}
+{"keyword":"آگهی موبایل","province":"اصفهان","count":5}
 ```
 
-Returns HTTP `202 Accepted` with the job ID and relative links. Reusing an `Idempotency-Key` with the same request returns the existing job; reusing it with a different body returns `409`.
+Returns HTTP `202 Accepted` with `job_id`, `schema_version: 2`, and relative `status_url`, `events_url`, and `result_url`. Reusing the same idempotency key and body returns the existing job; reusing it with a different body returns `409`.
+
+### Job status
+
+`GET /v1/jobs/{job_id}` returns status, accumulated flat results, warnings/errors, current round and stage, and page metrics. Status is `queued`, `running`, `completed`, or `failed`.
 
 ```json
 {
-  "job_id":"a1b2c3...",
-  "status":"queued",
-  "requested_count":10,
-  "current_round":0,
-  "total_rounds":3,
-  "successful_websites":0,
-  "total_unique_mobile_numbers":0,
-  "current_stage":"queued",
-  "created":true,
-  "status_url":"/v1/jobs/a1b2c3...",
-  "events_url":"/v1/jobs/a1b2c3.../events",
-  "result_url":"/v1/jobs/a1b2c3.../result"
+  "schema_version": 2,
+  "job_id": "example-job-id",
+  "status": "running",
+  "requested_count": 5,
+  "successful_results": 1,
+  "total_unique_mobile_numbers": 1,
+  "discovered_page_count": 4,
+  "processed_page_count": 2,
+  "successful_page_count": 1,
+  "results": [
+    {
+      "number": "09123456789",
+      "source_url": "https://divar.ir/v/listing-1",
+      "website_url": "https://divar.ir/",
+      "page_title": "عنوان واقعی آگهی",
+      "page_description": ""
+    }
+  ]
 }
 ```
 
-### 2. Poll status
+Page metrics describe candidate URLs returned by SearXNG and processed by the application. A candidate page is successful if its crawl contributes at least one previously unregistered mobile number. These metrics are separate from `successful_results`.
 
-`GET /v1/jobs/{job_id}` returns the current persisted job state, including current round/stage, sites discovered/processed/remaining for that round, successful website and unique number counts, per-website states, warnings/errors, accumulated results, and `last_event_id`.
+### SSE and reconnect
 
-Status values are `queued`, `running`, `completed`, or `failed`. `current_stage` reports finer-grained progress such as `searching`, `processing`, and terminal stages. Per-website states include `pending`, `processing`, `completed`, `failed`, and `skipped`.
+`GET /v1/jobs/{job_id}/events` streams persisted events as `text/event-stream`. Processing continues if the SSE client disconnects. Event IDs increase monotonically; reconnect using `Last-Event-ID` or `?last_event_id=...`. The service replays every later event in order and sends heartbeat comments every 15 seconds while idle.
 
-### 3. Stream results and resume after reconnect
-
-`GET /v1/jobs/{job_id}/events` returns `text/event-stream`. The worker is independent of the client connection, so disconnecting does not stop discovery. Events are persisted and assigned increasing IDs. Reconnect with the last received event ID:
-
-```http
-GET /v1/jobs/{job_id}/events
-Authorization: Bearer <API_KEY>
-Last-Event-ID: 17
-```
-
-Or use `?last_event_id=17` when the HTTP client cannot set `Last-Event-ID`. The server replays all later events in order. A heartbeat comment is sent every 15 seconds when there is no new event. Keep the connection open while consuming live results.
-
-Events include `job_started`, `round_started`, `progress`, `search_completed`, `website_started`, `website_completed`, `warning`, `round_completed`, `job_completed`, and `job_failed`. A `website_completed` event includes `result` when the site added one or more previously unregistered numbers:
+Each unique accepted phone produces one `result_found` event, persisted atomically with the result:
 
 ```text
-id: 21
-event: website_completed
-data: {"website_url":"https://example.ir/","status":"completed","result":{"website_url":"https://example.ir/","mobile_numbers":[{"number":"09123456789","source_url":"https://example.ir/contact"}]}}
+id: 25
+event: result_found
+data: {"result":{"number":"09123456789","source_url":"https://divar.ir/v/listing-1","website_url":"https://divar.ir/","page_title":"عنوان واقعی آگهی","page_description":""},"successful_results":1,"total_unique_mobile_numbers":1,"requested_count":5}
 ```
 
-Numbers are globally deduplicated across all websites and rounds. Only valid Iranian mobile numbers normalized as `09xxxxxxxxx` are returned; landlines are omitted. Each number preserves its source page URL.
+Page lifecycle events are URL-oriented. For example, `page_completed` includes `page_url`, `website_url`, `status`, `new_results_count`, `processed_page_count`, `successful_page_count`, `successful_results`, and `requested_count`. Other events include `job_started`, `round_started`, `search_completed`, `progress`, `warning`, `round_completed`, `job_completed`, and `job_failed`. The terminal `job_completed` event contains the final counters and flat result array.
 
-### 4. Fetch final result
+### Final result
 
-`GET /v1/jobs/{job_id}/result` returns HTTP `409` with the current status while the job is active. For a terminal job it returns:
+`GET /v1/jobs/{job_id}/result` returns `409` while a job is active, then the final response:
 
 ```json
 {
-  "job_id":"a1b2c3...",
-  "status":"completed",
-  "requested_count":10,
-  "successful_websites":8,
-  "total_unique_mobile_numbers":13,
-  "completed_rounds":3,
-  "results":[
-    {"website_url":"https://example.ir/","mobile_numbers":[{"number":"09123456789","source_url":"https://example.ir/contact"}]}
+  "schema_version": 2,
+  "job_id": "example-job-id",
+  "status": "completed",
+  "requested_count": 5,
+  "successful_results": 1,
+  "total_unique_mobile_numbers": 1,
+  "discovered_page_count": 12,
+  "processed_page_count": 9,
+  "successful_page_count": 1,
+  "completed_rounds": 2,
+  "results": [
+    {
+      "number": "09123456789",
+      "source_url": "https://divar.ir/v/listing-1",
+      "website_url": "https://divar.ir/",
+      "page_title": "عنوان واقعی آگهی",
+      "page_description": ""
+    }
   ],
-  "errors":[],
-  "warnings":[]
+  "errors": [],
+  "warnings": []
 }
 ```
 
-An empty search is a successful completed job with empty `results`. `404` means the job is unknown or expired. `401` means the token is absent or invalid. A failed job still exposes its accumulated result and error details.
+`successful_results == total_unique_mobile_numbers == len(results)`, and the count never exceeds `requested_count`. When all search rounds/pages are exhausted first, the job finishes as `completed` with its actual results and a warning that the requested count was not reached. Provider errors remain in `errors`/`warnings` and do not erase previously stored results. `404` means unknown or expired job; `401` means invalid/missing token.
 
-## Search and crawl rules
+## Search, crawl, and recovery behavior
 
-The job runner retains the three-round query strategy. Each round searches for `ceil(remaining_successful_websites * 1.6)` candidate URLs, processes unique domains, and stops once the requested successful website count is reached or all rounds are exhausted. Exact search queries have independent persisted SearXNG page cursors; a later request for that same query starts after its last consumed page. Domains processed in earlier rounds are excluded globally. Empty result pages end that query; HTTP/provider errors and invalid JSON are recorded as warnings/errors rather than silently treated as empty results.
+The service retains up to three search rounds, its existing query variations, `ceil(remaining_unique_numbers * 1.6)` URL target, SearXNG pagination limit, Firecrawl page/depth/time limits, and site concurrency. Pagination state is independent for each exact search query. Search result candidates and processed state are deduplicated by normalized full URL, not host.
 
-Firecrawl remains bounded by the crawl page/depth/deadline settings above. Website work is concurrent and each finished result is stored and emitted immediately, without waiting for other websites in the same batch.
+SQLite state uses `schema_version: 2`. On startup, legacy v1 nested website results are migrated to flat records, keeping the first occurrence of each valid mobile number and adding replayable `result_found` events where absent. Legacy processed domain strings are retained for audit only and are never treated as URL exclusions. Existing event history is kept.
 
-## Chabokan integration
+## Configuration and Chabokan
 
-From Chabokan, call the eventual public HTTPS hostname with the Bearer token and `POST /v1/discover`. Store the token in Chabokan's secret configuration. Persist the returned `job_id`; consume `/events` and reconnect with `Last-Event-ID`, or poll `/jobs/{job_id}` after a reconnect. Fetch `/result` when the status becomes terminal. This workflow is asynchronous: the create call should return quickly, and the client should apply its own bounded timeouts to status/event calls. The public base URL and certificate cannot be supplied until you provide a public DNS hostname for this VPS and trusted TLS is configured. No Chabokan files have been changed.
+The service reads `.env`; keep `API_KEY` out of source control. Existing settings include `SEARXNG_URL`, `FIRECRAWL_URL`, `SEARCH_TIMEOUT`, `MAX_SEARCH_PAGES`, `CRAWL_TIMEOUT`, `MAX_CRAWL_PAGES`, `MAX_CRAWL_DEPTH`, `MAX_CONCURRENT_SITES`, `JOB_DB_PATH`, `JOB_TTL_SECONDS`, and `JOB_CLEANUP_INTERVAL`.
 
-## Deploy, restart, and verification
+Chabokan should send `POST /v1/discover` with a Bearer token, store the returned job ID, consume SSE with `Last-Event-ID` on reconnect, and fetch the final result after terminal status. Public HTTPS remains a separate deployment step requiring a DNS hostname and trusted certificate; do not use public HTTP or expose port 8091 directly.
+
+## Tests
+
+Offline tests use deterministic fixtures and mocks:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl restart business-discovery
-sudo systemctl status business-discovery --no-pager
-curl --fail http://127.0.0.1:8091/health
 /opt/business-discovery/.venv/bin/python -m unittest discover -s /opt/business-discovery/tests -v
+```
+
+Live smoke test validates the deployed API, real SearXNG/Firecrawl path, flat records, and SSE:
+
+```bash
 /opt/business-discovery/.venv/bin/python /opt/business-discovery/test_service.py
 ```
 
-The live smoke test reads `API_KEY` from the service environment file or process environment, submits a real request, waits for completion, verifies status/result and SSE replay, and exits nonzero on failure. It uses the configured real local SearXNG and Firecrawl services.
+Optional live-test variables: `TEST_BASE_URL`, `TEST_KEYWORD`, `TEST_PROVINCE`, `TEST_COUNT`, and `TEST_JOB_TIMEOUT_SECONDS`.
+
+## Deployment note
+
+This code update intentionally does not restart or deploy the running service. After review, deployment commands are:
+
+```bash
+sudo systemctl restart business-discovery
+sudo systemctl status business-discovery --no-pager
+curl --fail http://127.0.0.1:8091/health
+```

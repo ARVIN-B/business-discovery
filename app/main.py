@@ -87,7 +87,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Iran Business Contact Discovery",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
     docs_url=None,
     redoc_url=None,
@@ -124,7 +124,11 @@ def normalize_url(value: str) -> str | None:
         if port and not (p.scheme == "http" and port == 80 or p.scheme == "https" and port == 443):
             netloc += f":{port}"
         path = re.sub(r"/{2,}", "/", p.path or "/").rstrip("/") or "/"
-        query = urlencode(sorted((k, v) for k, v in parse_qsl(p.query) if not k.lower().startswith("utm_") and k.lower() not in {"fbclid", "gclid"}))
+        tracking_keys = {"fbclid", "gclid", "dclid", "gbraid", "wbraid", "msclkid", "yclid"}
+        query = urlencode([
+            (key, item) for key, item in parse_qsl(p.query, keep_blank_values=True)
+            if not key.lower().startswith("utm_") and key.lower() not in tracking_keys
+        ])
         return urlunsplit((p.scheme, netloc, path, query, ""))
     except (ValueError, UnicodeError):
         return None
@@ -152,21 +156,21 @@ async def search_sites(
     keyword: str,
     province: str,
     needed: int,
-    excluded_domains: set[str] | None = None,
+    excluded_urls: set[str] | None = None,
     round_number: int = 1,
     start_page: int = 1,
     initial_sites: list[dict] | None = None,
     page_callback=None,
     max_pages: int | None = None,
 ) -> list[dict]:
-    excluded = excluded_domains or set()
+    excluded = {normalized for url in (excluded_urls or set()) if (normalized := normalize_url(url))}
     page_limit = max_pages if max_pages is not None else MAX_SEARCH_PAGES
     query = search_query_for_round(keyword, province, round_number)
     sites: dict[str, dict] = {}
     for site in initial_sites or []:
-        domain = domain_of(site.get("url", ""))
-        if domain and domain not in excluded:
-            sites.setdefault(domain, site)
+        normalized = normalize_url(str(site.get("url", "")))
+        if normalized and normalized not in excluded:
+            sites.setdefault(normalized, {**site, "url": normalized, "website_url": homepage_url(normalized)})
 
     if len(sites) >= needed:
         return list(sites.values())[:needed]
@@ -193,15 +197,14 @@ async def search_sites(
                 normalized = normalize_url(str(item.get("url", "")))
                 if not normalized:
                     continue
-                domain = domain_of(normalized)
-                if domain in excluded or domain in sites:
+                if normalized in excluded or normalized in sites:
                     continue
                 site = {
                     "url": normalized,
                     "website_url": homepage_url(normalized),
-                    "title": str(item.get("title", ""))[:300],
+                    "search_title": str(item.get("title", ""))[:300],
                 }
-                sites[domain] = site
+                sites[normalized] = site
                 new_sites.append(site)
 
             exhausted = len(items) == 0
@@ -288,7 +291,8 @@ async def firecrawl_crawl(client: httpx.AsyncClient, site: dict) -> tuple[list[d
 
 def page_source(page: dict, fallback: str) -> str:
     metadata = page.get("metadata") or {}
-    return normalize_url(str(metadata.get("sourceURL") or metadata.get("url") or page.get("url") or fallback)) or fallback
+    raw_source = metadata.get("sourceURL") or metadata.get("url") or page.get("url") or fallback
+    return normalize_url(str(raw_source)) or ""
 
 
 def page_priority(page: dict, fallback: str) -> tuple[int, int]:
@@ -304,20 +308,33 @@ async def process_site(client: httpx.AsyncClient, site: dict, semaphore: asyncio
     async with semaphore:
         pages, error = await firecrawl_crawl(client, site)
     if error and not pages:
-        log.warning("Skipping failed website %s (%s)", site["website_url"], error)
-        return {"website_url": site["website_url"], "phones": {}, "error": error}
+        log.warning("Skipping failed page %s (%s)", site["url"], error)
+        return {"page_url": site["url"], "pages": [], "error": error}
 
     pages.sort(key=lambda page: page_priority(page, site["url"]))
-    phones: dict[str, str] = {}
+    extracted_pages: dict[str, dict] = {}
     for page in pages:
         source = page_source(page, site["url"])
-        if domain_of(source) != domain_of(site["url"]):
+        if not source or domain_of(source) != domain_of(site["url"]):
             continue
         content = "\n".join(str(page.get(key) or "") for key in ("markdown", "html", "rawHtml"))
-        for number in extract_mobile_numbers(content):
-            phones.setdefault(number, source)
+        metadata = page.get("metadata") or {}
+        title = metadata.get("title") or page.get("title") or ""
+        description = metadata.get("description") or page.get("description") or ""
+        entry = extracted_pages.setdefault(source, {
+            "source_url": source,
+            "website_url": homepage_url(source),
+            "page_title": str(title)[:500] if title else "",
+            "page_description": str(description)[:2000] if description else "",
+            "numbers": [],
+        })
+        entry["numbers"] = sorted(set(entry["numbers"]) | set(extract_mobile_numbers(content)))
+        if not entry["page_title"] and title:
+            entry["page_title"] = str(title)[:500]
+        if not entry["page_description"] and description:
+            entry["page_description"] = str(description)[:2000]
 
-    if not phones:
+    if not any(entry["numbers"] for entry in extracted_pages.values()):
         candidates: list[str] = []
         for page in pages:
             source = page_source(page, site["url"])
@@ -341,14 +358,26 @@ async def process_site(client: httpx.AsyncClient, site: dict, semaphore: asyncio
                     metadata = data.get("metadata") or {}
                     source = normalize_url(str(metadata.get("sourceURL") or metadata.get("url") or target)) or target
                     if domain_of(source) == domain_of(site["url"]):
-                        for number in extract_mobile_numbers(content):
-                            phones.setdefault(number, source)
+                        title = metadata.get("title") or data.get("title") or ""
+                        description = metadata.get("description") or data.get("description") or ""
+                        entry = extracted_pages.setdefault(source, {
+                            "source_url": source,
+                            "website_url": homepage_url(source),
+                            "page_title": str(title)[:500] if title else "",
+                            "page_description": str(description)[:2000] if description else "",
+                            "numbers": [],
+                        })
+                        entry["numbers"] = sorted(set(entry["numbers"]) | set(extract_mobile_numbers(content)))
+                        if not entry["page_title"] and title:
+                            entry["page_title"] = str(title)[:500]
+                        if not entry["page_description"] and description:
+                            entry["page_description"] = str(description)[:2000]
                 except (httpx.HTTPError, ValueError) as exc:
                     log.warning("Contact page scrape failed (%s)", type(exc).__name__)
 
     if error:
-        log.warning("Partial crawl for %s (%s)", site["website_url"], error)
-    return {"website_url": site["website_url"], "phones": phones, "error": error}
+        log.warning("Partial crawl for %s (%s)", site["url"], error)
+    return {"page_url": site["url"], "pages": list(extracted_pages.values()), "error": error}
 
 
 async def process_site_in_background(site: dict, semaphore: asyncio.Semaphore) -> dict:
@@ -357,14 +386,15 @@ async def process_site_in_background(site: dict, semaphore: asyncio.Semaphore) -
 
 
 async def run_discovery(keyword: str, province: str, target_count: int, search_fn=None, process_fn=None) -> dict:
-    """Synchronous core retained for regression tests and non-API callers."""
+    """Deterministic URL-level runner retained for unit/regression tests."""
     search_fn = search_fn or search_sites
     process_fn = process_fn or process_site
-    processed_domains: set[str] = set()
+    processed_urls: set[str] = set()
     registered_numbers: set[str] = set()
     results: list[dict] = []
     warnings: list[str] = []
     completed_rounds = 0
+    processed_page_count = successful_page_count = discovered_page_count = 0
 
     for round_number in range(1, MAX_SEARCH_ROUNDS + 1):
         remaining = target_count - len(results)
@@ -372,7 +402,7 @@ async def run_discovery(keyword: str, province: str, target_count: int, search_f
             break
         url_target = ceil(remaining * SEARCH_URL_FACTOR)
         try:
-            sites = await search_fn(keyword, province, url_target, excluded_domains=processed_domains, round_number=round_number)
+            sites = await search_fn(keyword, province, url_target, excluded_urls=processed_urls, round_number=round_number)
         except RuntimeError as exc:
             if completed_rounds == 0:
                 raise
@@ -381,45 +411,53 @@ async def run_discovery(keyword: str, province: str, target_count: int, search_f
             log.error("%s; returning results from completed rounds", warning)
             break
         completed_rounds = round_number
-        unique_sites = []
+        unique_sites: list[dict] = []
+        round_seen: set[str] = set()
         for site in sites:
             normalized = normalize_url(str(site.get("url", "")))
             if not normalized:
                 continue
-            domain = domain_of(normalized)
-            if domain in processed_domains:
+            if normalized in processed_urls or normalized in round_seen:
                 continue
-            processed_domains.add(domain)
+            round_seen.add(normalized)
             unique_sites.append({**site, "url": normalized, "website_url": homepage_url(normalized)})
+            discovered_page_count += 1
         if not unique_sites:
             continue
         async with httpx.AsyncClient(timeout=httpx.Timeout(60, connect=10), follow_redirects=False) as client:
             semaphore = asyncio.Semaphore(MAX_CONCURRENT_SITES)
-            for offset in range(0, len(unique_sites), MAX_CONCURRENT_SITES):
-                batch = unique_sites[offset : offset + MAX_CONCURRENT_SITES]
-                batch_results = await asyncio.gather(*(process_fn(client, site, semaphore) for site in batch))
-                for site_result in batch_results:
-                    if site_result.get("error"):
-                        log.warning("Website processing issue: %s", site_result["error"])
-                    phones = site_result.get("phones") or {}
-                    new_numbers = [number for number in phones if number not in registered_numbers]
-                    if not new_numbers:
-                        continue
-                    website_result = {"website_url": site_result["website_url"], "mobile_numbers": []}
-                    for number in new_numbers:
-                        registered_numbers.add(number)
-                        website_result["mobile_numbers"].append({"number": number, "source_url": phones[number]})
-                    results.append(website_result)
-                    if len(results) >= target_count:
-                        break
+            for site in unique_sites:
                 if len(results) >= target_count:
                     break
+                processed_urls.add(site["url"])
+                site_result = await process_fn(client, site, semaphore)
+                processed_page_count += 1
+                page_added = 0
+                for page in site_result.get("pages", []):
+                    for number in sorted(set(page.get("numbers", []))):
+                        number = normalize_mobile(str(number))
+                        if not number or number in registered_numbers or len(results) >= target_count:
+                            continue
+                        registered_numbers.add(number)
+                        results.append({
+                            "number": number,
+                            "source_url": page["source_url"],
+                            "website_url": page.get("website_url") or homepage_url(page["source_url"]),
+                            "page_title": page.get("page_title", ""),
+                            "page_description": page.get("page_description", ""),
+                        })
+                        page_added += 1
+                successful_page_count += bool(page_added)
         if len(results) >= target_count:
             break
     response = {
+        "schema_version": 2,
         "requested_count": target_count,
-        "successful_websites": len(results),
+        "successful_results": len(results),
         "total_unique_mobile_numbers": len(registered_numbers),
+        "discovered_page_count": discovered_page_count,
+        "processed_page_count": processed_page_count,
+        "successful_page_count": successful_page_count,
         "completed_rounds": completed_rounds,
         "results": results,
     }
