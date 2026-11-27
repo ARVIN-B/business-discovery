@@ -43,7 +43,7 @@ def request(url, *, payload=None, headers=None, timeout=30):
         raise RuntimeError(f"Request timed out after {timeout}s: {url}") from exc
 
 
-def read_sse(url, headers, timeout):
+def read_sse(url, headers, timeout, on_event=None):
     req = urllib.request.Request(url, headers={**headers, "Accept": "text/event-stream"})
     events = []
     current = {}
@@ -57,6 +57,8 @@ def read_sse(url, headers, timeout):
                     if current:
                         current["data"] = json.loads(current.pop("raw_data")) if "raw_data" in current else None
                         events.append(current)
+                        if on_event:
+                            on_event(current)
                         current = {}
                     continue
                 if line.startswith(":"):
@@ -119,19 +121,25 @@ def main():
         raise RuntimeError("202 response omitted job links")
     print(f"Job accepted: {job_id} (status={created.get('status')})")
 
-    status_url = urljoin(BASE_URL + "/", created["status_url"])
     events_url = urljoin(BASE_URL + "/", created["events_url"])
     result_url = urljoin(BASE_URL + "/", created["result_url"])
     deadline = time.monotonic() + JOB_TIMEOUT
-    while True:
-        if time.monotonic() >= deadline:
-            raise RuntimeError(f"Job did not finish within {JOB_TIMEOUT}s")
-        status, job = request(status_url, headers=auth, timeout=30)
-        if status != 200 or job.get("schema_version") != 2:
-            raise RuntimeError("Status endpoint returned an invalid response")
-        if job.get("status") in {"completed", "failed", "stopped"}:
-            break
-        time.sleep(1)
+    if time.monotonic() >= deadline:
+        raise RuntimeError(f"Job did not finish within {JOB_TIMEOUT}s")
+
+    def approve_completed_url(event):
+        if event.get("event") != "url_completed":
+            return
+        decision_url = event["data"].get("decision_url")
+        if not decision_url:
+            return
+        request(urljoin(BASE_URL + "/", decision_url), payload=True,
+                headers={**auth, "Content-Type": "application/json"}, timeout=30)
+
+    events = read_sse(events_url, auth, timeout=JOB_TIMEOUT, on_event=approve_completed_url)
+    status, job = request(urljoin(BASE_URL + "/", created["status_url"]), headers=auth, timeout=30)
+    if status != 200 or job.get("schema_version") != 2:
+        raise RuntimeError("Status endpoint returned an invalid response")
     print(
         "Pages: discovered={discovered}, processed={processed}, successful={successful}; results={results}/{target}".format(
             discovered=job["discovered_page_count"], processed=job["processed_page_count"],
@@ -167,16 +175,17 @@ def main():
         print(f"    Source URL: {record['source_url']}")
         print(f"    Website: {record['website_url']}")
 
-    events = read_sse(events_url, auth, timeout=60)
     ids = [event.get("id") for event in events]
     if not events or any(value is None for value in ids) or ids != sorted(set(ids)):
         raise RuntimeError("SSE event IDs are missing, duplicated, or out of order")
     event_names = [event.get("event") for event in events]
-    if event_names[0] != "job_started" or event_names[-1] != "job_completed":
+    if event_names[0] != "job_started" or event_names[-1] not in {"job_completed", "job_stopped"}:
         raise RuntimeError("SSE lifecycle events are incomplete")
     streamed = [record for event in events if event.get("event") == "url_results_found" for record in event["data"].get("results", [])]
     if streamed != final["results"]:
         raise RuntimeError("url_results_found events do not reproduce the final flat results")
+    if sum(1 for event in events if event.get("event") == "url_completed") != sum(1 for event in events if event.get("event") == "page_completed"):
+        raise RuntimeError("Every completed URL must have a durable url_completed event")
     page_events = [event for event in events if event.get("event") == "page_completed"]
     if any("page_url" not in event["data"] or "website_url" not in event["data"] for event in page_events):
         raise RuntimeError("A page_completed event is missing URL-level identity")

@@ -12,6 +12,7 @@ from app.main import (
     normalize_url,
     process_site,
     run_discovery,
+    search_queries_for_job,
     search_sites,
 )
 
@@ -123,6 +124,11 @@ class FirecrawlFailureTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SearchPageTests(unittest.IsolatedAsyncioTestCase):
+    def test_search_strategy_has_many_distinct_queries(self):
+        queries = search_queries_for_job("کفش", "اصفهان")
+        self.assertGreaterEqual(len(queries), 25)
+        self.assertEqual(len(queries), len(set(queries)))
+
     async def test_accepts_many_same_domain_urls_and_deduplicates_complete_normalized_url(self):
         response = httpx.Response(200, json={"results": [
             {"url": "https://www.divar.ir/v/1?utm_source=x&city=esfahan"},
@@ -133,7 +139,10 @@ class SearchPageTests(unittest.IsolatedAsyncioTestCase):
         class Client:
             async def __aenter__(self): return self
             async def __aexit__(self, *args): return None
-            async def get(self, *args, **kwargs): return response
+            async def get(self, _url, params):
+                if params["pageno"] == 1:
+                    return response
+                return httpx.Response(200, json={"results": []}, request=httpx.Request("GET", _url))
 
         with patch("app.main.httpx.AsyncClient", return_value=Client()):
             pages = await search_sites("آگهی", "اصفهان", 10)
@@ -149,7 +158,10 @@ class SearchPageTests(unittest.IsolatedAsyncioTestCase):
         class Client:
             async def __aenter__(self): return self
             async def __aexit__(self, *args): return None
-            async def get(self, *args, **kwargs): return response
+            async def get(self, _url, params):
+                if params["pageno"] == 1:
+                    return response
+                return httpx.Response(200, json={"results": []}, request=httpx.Request("GET", _url))
 
         with patch("app.main.httpx.AsyncClient", return_value=Client()):
             pages = await search_sites("آگهی", "اصفهان", 5, excluded_urls={"https://divar.ir/v/1"})

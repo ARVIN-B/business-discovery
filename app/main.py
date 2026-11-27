@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import time
+from email.utils import parsedate_to_datetime
 from contextlib import asynccontextmanager
 from math import ceil
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
@@ -19,7 +20,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from .job_manager import IdempotencyConflict, JobManager
-from .job_store import JobStore, TERMINAL
+from .job_store import DecisionConflict, JobStore, TERMINAL
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("business_discovery")
@@ -32,9 +33,11 @@ CRAWL_TIMEOUT = float(os.getenv("CRAWL_TIMEOUT", "240"))
 MAX_CRAWL_PAGES = int(os.getenv("MAX_CRAWL_PAGES", "10"))
 MAX_CRAWL_DEPTH = int(os.getenv("MAX_CRAWL_DEPTH", "2"))
 MAX_CONCURRENT_SITES = int(os.getenv("MAX_CONCURRENT_SITES", "3"))
-MAX_SEARCH_ROUNDS = 3
 SEARCH_URL_FACTOR = 1.6
-MAX_SEARCH_PAGES = int(os.getenv("MAX_SEARCH_PAGES", "50"))
+MAX_SEARCH_ROUNDS = 3  # Retained only by the legacy synchronous helper.
+SEARCH_BATCH_SIZE = max(1, int(os.getenv("SEARCH_BATCH_SIZE", "1000")))
+SEARCH_RETRY_SECONDS = max(1, int(os.getenv("SEARCH_RETRY_SECONDS", "60")))
+MAX_SEARCH_PAGES = int(os.getenv("MAX_SEARCH_PAGES", "0"))
 JOB_DB_PATH = os.getenv("JOB_DB_PATH", "/opt/business-discovery/data/jobs.sqlite3")
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", str(7 * 24 * 60 * 60)))
 JOB_CLEANUP_INTERVAL = int(os.getenv("JOB_CLEANUP_INTERVAL", "3600"))
@@ -72,9 +75,11 @@ async def lifespan(app: FastAPI):
         process_fn=process_site_in_background,
         normalize_phone_fn=normalize_mobile,
         max_concurrent_sites=MAX_CONCURRENT_SITES,
-        max_rounds=MAX_SEARCH_ROUNDS,
+        max_rounds=3,
         url_factor=SEARCH_URL_FACTOR,
         max_search_pages=MAX_SEARCH_PAGES,
+        search_batch_size=SEARCH_BATCH_SIZE,
+        search_retry_seconds=SEARCH_RETRY_SECONDS,
         cleanup_interval=JOB_CLEANUP_INTERVAL,
     )
     await manager.start()
@@ -87,7 +92,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Iran Business Contact Discovery",
-    version="4.0.0",
+    version="5.0.0",
     lifespan=lifespan,
     docs_url=None,
     redoc_url=None,
@@ -144,12 +149,32 @@ def homepage_url(url: str) -> str:
 
 
 def search_query_for_round(keyword: str, province: str, round_number: int) -> str:
-    query = f"{keyword} {province} ایران"
-    if round_number == 2:
-        query += " شماره تماس"
-    elif round_number == 3:
-        query += " سایت رسمی تماس"
-    return query
+    strategies = search_queries_for_job(keyword, province)
+    return strategies[(round_number - 1) % len(strategies)]
+
+
+def search_queries_for_job(keyword: str, province: str) -> list[str]:
+    base = [keyword, f'"{keyword}"']
+    local = [province, f'استان {province}', f'{province} ایران']
+    intents = ["", "شماره تماس", "موبایل", "تماس با ما", "فروشگاه", "خدمات", "نمایندگی", "آدرس تلفن"]
+    queries = []
+    for term in intents:
+        for phrase in base:
+            for location in local[:2]:
+                query = " ".join(part for part in (phrase, location, term, "ایران") if part)
+                if query not in queries:
+                    queries.append(query)
+    for term in ("شماره موبایل", "اطلاعات تماس", "خرید", "مرکز فروش"):
+        query = f"{keyword} {province} {term} ایران"
+        if query not in queries:
+            queries.append(query)
+    return queries
+
+
+class SearchProviderError(RuntimeError):
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 async def search_sites(
@@ -164,7 +189,7 @@ async def search_sites(
     max_pages: int | None = None,
 ) -> list[dict]:
     excluded = {normalized for url in (excluded_urls or set()) if (normalized := normalize_url(url))}
-    page_limit = max_pages if max_pages is not None else MAX_SEARCH_PAGES
+    page_limit = (None if max_pages == 0 else max_pages) if max_pages is not None else (MAX_SEARCH_PAGES or None)
     query = search_query_for_round(keyword, province, round_number)
     sites: dict[str, dict] = {}
     for site in initial_sites or []:
@@ -176,7 +201,8 @@ async def search_sites(
         return list(sites.values())[:needed]
 
     async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT, follow_redirects=True) as client:
-        for page_no in range(start_page, page_limit + 1):
+        page_no = start_page
+        while page_limit is None or page_no <= page_limit:
             try:
                 response = await client.get(
                     f"{SEARXNG_URL.rstrip('/')}/search",
@@ -188,7 +214,17 @@ async def search_sites(
                     raise ValueError("invalid SearXNG JSON response structure")
                 items = payload["results"]
             except (httpx.HTTPError, ValueError, TypeError) as exc:
-                raise RuntimeError(f"SearXNG request failed: {type(exc).__name__}") from exc
+                retry_after = None
+                response = getattr(exc, "response", None)
+                if response is not None:
+                    try:
+                        retry_after = max(0.0, float(response.headers.get("Retry-After", "")))
+                    except (TypeError, ValueError):
+                        try:
+                            retry_after = max(0.0, parsedate_to_datetime(response.headers.get("Retry-After", "")).timestamp() - time.time())
+                        except (TypeError, ValueError, OverflowError):
+                            pass
+                raise SearchProviderError(f"SearXNG request failed: {type(exc).__name__}", retry_after) from exc
 
             new_sites: list[dict] = []
             for item in items:
@@ -209,9 +245,12 @@ async def search_sites(
 
             exhausted = len(items) == 0
             if page_callback:
-                await page_callback(page_no + 1, new_sites, exhausted)
+                keep_searching = await page_callback(page_no + 1, new_sites, exhausted)
+                if keep_searching is False:
+                    break
             if (needed is not None and len(sites) >= needed) or exhausted:
                 break
+            page_no += 1
     return list(sites.values()) if needed is None else list(sites.values())[:needed]
 
 
@@ -502,6 +541,23 @@ async def stop_discovery_job(job_id: str, request: Request):
     if outcome is None:
         raise HTTPException(status_code=404, detail="Job not found or expired")
     return {"job_id": job_id, **outcome}
+
+
+@app.post("/v1/jobs/{job_id}/decisions/{decision_id}", status_code=202, dependencies=[Depends(require_key)])
+async def submit_job_decision(job_id: str, decision_id: str, request: Request):
+    try:
+        payload = await request.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Body must be the JSON boolean true or false") from exc
+    if type(payload) is not bool:
+        raise HTTPException(status_code=422, detail="Body must be the JSON boolean true or false")
+    manager = get_job_manager(request)
+    try:
+        return manager.decide(job_id, decision_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Job not found or expired") from exc
+    except DecisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/v1/jobs/{job_id}/events", dependencies=[Depends(require_key)])

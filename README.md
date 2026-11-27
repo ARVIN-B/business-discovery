@@ -1,176 +1,109 @@
 # Business Discovery API
 
-Independent FastAPI service that searches local SearXNG and uses the existing Firecrawl service to discover Iranian mobile numbers. Discovery runs as a durable job and publishes all new unique numbers from a candidate URL together after that URL finishes.
+FastAPI service that searches SearXNG and crawls candidate URLs with Firecrawl. New jobs use a durable batch/search queue and wait for an external Boolean decision after every completed URL. The intended consumer is `info`.
 
 ## Runtime
 
 - Application: `/opt/business-discovery`
-- API listener: `http://127.0.0.1:8091` (loopback only)
+- API listener: `http://127.0.0.1:8091`
 - Health: `GET /health`
-- SearXNG: `http://127.0.0.1:8889`
-- Firecrawl: `http://127.0.0.1:3002`
-- SQLite job/event store: `/opt/business-discovery/data/jobs.sqlite3`
+- SQLite jobs and events: `/opt/business-discovery/data/jobs.sqlite3`
 - Service: `business-discovery.service`
-- Logs: `journalctl -u business-discovery`
 
-The API requires Bearer authentication on `/v1`. It uses one Uvicorn worker and a process lock on the SQLite file. Job state and events survive application restart. The database retains records for seven days by default. This is a single-host design, not a multi-instance queue.
+Every `/v1` endpoint requires `Authorization: Bearer <API_KEY>`. The service uses a single Uvicorn worker and SQLite process lock. Job state, URL queue, query cursors, decisions, results, and ordered SSE events are stored durably.
 
-## URL-level discovery
-
-Every normalized full URL is an independent search candidate. Multiple listing, product, or seller pages under the same domain are not collapsed together. Tracking parameters such as `utm_*`, `fbclid`, and `gclid` are removed while listing IDs and meaningful query parameters are kept. Previously processed full URLs are excluded on later rounds; other pages on the same domain remain eligible.
-
-Firecrawl may return several crawled pages for one candidate URL. Each extracted mobile number is associated with the actual normalized page URL and metadata returned for that page. `website_url` is the root origin for secondary display; `source_url` is the primary clickable result. The API does not infer names or descriptions. Missing metadata is an empty string.
-
-`count` means the target number of unique valid Iranian mobile numbers; omit it or set it to `null` for unlimited discovery. Numbers are normalized to `09xxxxxxxxx`, deduplicated across the whole job, and limited to the first valid source encountered. One URL can return multiple flat result records. In limited mode, `count` is a URL-boundary threshold: if a URL takes the job past the target, all newly found numbers from that URL are returned. URLs already processing concurrently also finish and publish their complete results; the service starts no further URLs after the threshold is met.
-
-## API workflow (schema version 2)
-
-All `/v1` requests require:
-
-```http
-Authorization: Bearer <API_KEY>
-```
-
-### Create a job
+## Create and follow a job
 
 ```http
 POST /v1/discover
 Content-Type: application/json
+Authorization: Bearer <API_KEY>
 Idempotency-Key: optional-client-generated-key
 ```
 
 ```json
-{"keyword":"آگهی موبایل","province":"اصفهان","count":5}
+{"keyword":"آگهی موبایل","province":"اصفهان"}
 ```
 
-For unlimited mode:
+`count` remains accepted for request compatibility, but new approval-controlled jobs do not stop based on it. A created job returns `job_id`, `status_url`, `events_url`, `result_url`, and `stop_url`.
 
-```json
-{"keyword":"آگهی موبایل","province":"اصفهان","count":null}
-```
+The job collects a full URL batch before crawling. `SEARCH_BATCH_SIZE` defaults to 1000. Search consumes pages until that many unique valid URLs are queued or all search queries are exhausted. Any extra URLs from the last SearXNG page remain queued for the next batch. URLs are normalized and added to the durable `seen_urls` set when discovered, so duplicates across pages, queries, and batches are ignored. Distinct listing paths and meaningful query parameters remain separate candidates.
 
-The `count` field may also be omitted. Unlimited jobs continue through the configured search rounds and pagination until the available search space is exhausted or the client stops the job.
+Each URL is crawled sequentially. When it finishes, the service persists its full set of new numbers and a `url_completed` event, then waits in `awaiting_approval`. It does not start another URL or search batch until the decision arrives. URLs with zero numbers and URLs with a Firecrawl error still produce `url_completed` and await a decision.
 
-Returns HTTP `202 Accepted` with `job_id`, `schema_version: 2`, and relative `status_url`, `events_url`, and `result_url`. Reusing the same idempotency key and body returns the existing job; reusing it with a different body returns `409`.
+### Boolean decision protocol
 
-### Job status
-
-`GET /v1/jobs/{job_id}` returns mode, status, accumulated flat results, warnings/errors, current round and stage, and page metrics. Status is `queued`, `running`, `completed`, `failed`, or `stopped`.
-
-```json
-{
-  "schema_version": 2,
-  "job_id": "example-job-id",
-  "status": "running",
-  "requested_count": 5,
-  "successful_results": 1,
-  "total_unique_mobile_numbers": 1,
-  "discovered_page_count": 4,
-  "processed_page_count": 2,
-  "successful_page_count": 1,
-  "results": [
-    {
-      "number": "09123456789",
-      "source_url": "https://divar.ir/v/listing-1",
-      "website_url": "https://divar.ir/",
-      "page_title": "عنوان واقعی آگهی",
-      "page_description": ""
-    }
-  ]
-}
-```
-
-Page metrics describe candidate URLs returned by SearXNG and processed by the application. A candidate page is successful if its crawl contributes at least one previously unregistered mobile number. These metrics are separate from `successful_results`.
-
-### SSE and reconnect
-
-`GET /v1/jobs/{job_id}/events` streams persisted events as `text/event-stream`. Processing continues if the SSE client disconnects. Event IDs increase monotonically; reconnect using `Last-Event-ID` or `?last_event_id=...`. The service replays every later event in order and sends heartbeat comments every 15 seconds while idle.
-
-Each completed URL with new numbers produces one `url_results_found` event containing its complete result list. The URL results, page completion state, and event are persisted in one SQLite transaction:
-
-```text
-id: 25
-event: url_results_found
-data: {"candidate_url":"https://divar.ir/v/listing-1","results":[{"number":"09123456789","source_url":"https://divar.ir/v/listing-1","website_url":"https://divar.ir/","page_title":"عنوان واقعی آگهی","page_description":""}],"successful_results":1,"total_unique_mobile_numbers":1,"requested_count":5,"mode":"limited"}
-```
-
-Page lifecycle events are URL-oriented. For example, `page_completed` includes `page_url`, `website_url`, `status`, `new_results_count`, `processed_page_count`, `successful_page_count`, `successful_results`, and `requested_count`. Other events include `job_started`, `round_started`, `search_completed`, `progress`, `warning`, `round_completed`, `job_stop_requested`, `job_stopped`, `job_completed`, and `job_failed`. The terminal event contains the final counters and flat result array.
-
-### Stop a job
+The `url_completed` SSE event includes a unique `decision_id` and `decision_url`. Send a JSON Boolean as the entire request body:
 
 ```http
-POST /v1/jobs/{job_id}/stop
+POST /v1/jobs/{job_id}/decisions/{decision_id}
 Authorization: Bearer <API_KEY>
+Content-Type: application/json
 ```
 
-Returns `202 Accepted`. Repeated requests are safe. The service stops starting new URLs after the request is accepted, lets URLs already in progress finish, then reports terminal status `stopped` and emits `job_stopped`. A running job remains `running` while any active URL is finishing.
-
-### Final result
-
-`GET /v1/jobs/{job_id}/result` returns `409` while a job is active, then the final response:
+Continue:
 
 ```json
-{
-  "schema_version": 2,
-  "job_id": "example-job-id",
-  "status": "completed",
-  "requested_count": 5,
-  "successful_results": 1,
-  "total_unique_mobile_numbers": 1,
-  "discovered_page_count": 12,
-  "processed_page_count": 9,
-  "successful_page_count": 1,
-  "completed_rounds": 2,
-  "results": [
-    {
-      "number": "09123456789",
-      "source_url": "https://divar.ir/v/listing-1",
-      "website_url": "https://divar.ir/",
-      "page_title": "عنوان واقعی آگهی",
-      "page_description": ""
-    }
-  ],
-  "errors": [],
-  "warnings": []
-}
+true
 ```
 
-`successful_results == total_unique_mobile_numbers == len(results)`. Limited jobs can exceed `requested_count` because the whole URL that reaches the threshold, and any URLs already active concurrently, publish all their numbers. Unlimited jobs return `requested_count: null`. When search rounds/pages are exhausted, either mode finishes as `completed`; limited jobs include a warning if they did not reach their target. Provider errors remain in `errors`/`warnings` and do not erase previously stored results. `404` means unknown or expired job; `401` means invalid/missing token.
+Stop:
 
-## Search, crawl, and recovery behavior
+```json
+false
+```
 
-The service retains up to three search rounds, its existing query variations, `ceil(remaining_unique_numbers * 1.6)` URL target in limited mode, SearXNG pagination limit, Firecrawl page/depth/time limits, and site concurrency. Unlimited mode has no numeric URL/result target. Pagination state is independent for each exact search query. Search result candidates and processed state are deduplicated by normalized full URL, not host.
+Only literal JSON `true` or `false` is accepted. The same decision can be repeated idempotently. Sending the opposite value for an already decided ID, or an unknown/stale decision ID, returns `409`. `true` advances to the next URL, or starts search for another batch when the current batch is done. `false` ends the job as `stopped` and preserves accumulated results.
 
-Public result/event payloads retain `schema_version: 2`. An internal job model marker distinguishes new limited/unlimited and stop behavior from migrated jobs. On startup, legacy v1 nested website results are migrated to flat records, keeping the first occurrence of each valid mobile number and preserving the stored requested target. Legacy processed domain strings are retained for audit only and are never treated as URL exclusions. Existing event history is kept.
+The existing `POST /v1/jobs/{job_id}/stop` endpoint remains available for immediate cancellation. It can stop a job waiting for approval without needing a decision ID.
 
-## Configuration and Chabokan
+## SSE and result contract
 
-The service reads `.env`; keep `API_KEY` out of source control. Existing settings include `SEARXNG_URL`, `FIRECRAWL_URL`, `SEARCH_TIMEOUT`, `MAX_SEARCH_PAGES`, `CRAWL_TIMEOUT`, `MAX_CRAWL_PAGES`, `MAX_CRAWL_DEPTH`, `MAX_CONCURRENT_SITES`, `JOB_DB_PATH`, `JOB_TTL_SECONDS`, and `JOB_CLEANUP_INTERVAL`.
+`GET /v1/jobs/{job_id}/events` streams durable events. Reconnect with `Last-Event-ID` or `?last_event_id=...`; event IDs are monotonically increasing and replayed in order.
 
-Chabokan should send `POST /v1/discover` with a Bearer token, store the returned job ID, consume SSE with `Last-Event-ID` on reconnect, and fetch the final result after terminal status. Public HTTPS remains a separate deployment step requiring a DNS hostname and trusted certificate; do not use public HTTP or expose port 8091 directly.
+Every completed candidate URL produces `url_completed`, including URLs with no new numbers. When it has new results, the previous `url_results_found` event is also retained for compatibility; consumers should count results from `url_completed` only.
+
+```text
+event: url_completed
+data: {"candidate_url":"https://example.ir/listing/42","results":[{"number":"09123456789","source_url":"https://example.ir/listing/42","website_url":"https://example.ir/","page_title":"آگهی","page_description":""}],"new_results_count":1,"error":null,"decision_id":"d1...","decision_url":"/v1/jobs/JOB_ID/decisions/d1...","batch_number":1}
+```
+
+Each result record has exactly `number`, `source_url`, `website_url`, `page_title`, and `page_description`. Numbers are normalized to `09xxxxxxxxx` and deduplicated across the full job. `source_url` preserves the actual listing/page URL; `website_url` is its root origin.
+
+`GET /v1/jobs/{job_id}` exposes status, current stage, queued and seen URL counts, batch position, `pending_decision_id`, results, and errors. Typical stages are `searching`, `crawling`, and `awaiting_approval`. `GET /v1/jobs/{job_id}/result` returns `409` until the job is terminal (`completed`, `failed`, or `stopped`).
+
+## Search, retries, and recovery
+
+The search strategy creates a set of distinct keyword/location/contact queries and stores an independent next-page cursor and exhaustion state for each query. An empty page exhausts only that query. Search continues into other queries until a full URL batch is ready or the entire strategy is exhausted. The old fixed three-round workflow is not used for new jobs.
+
+`MAX_SEARCH_PAGES` defaults to `0`, meaning no page-count limit. If SearXNG fails, the cursor is retained and retry is scheduled after `SEARCH_RETRY_SECONDS` (default 60), or after a valid SearXNG `Retry-After` value. A failed URL is reported to the consumer and does not terminate the job.
+
+Internal job model version 4 stores the queue, seen URLs, batch, query cursors, page states, pending decision, decision history, and results in SQLite. On restart, a job awaiting approval keeps the same decision ID. An interrupted crawl URL is returned to pending and safely retried; result rows and their URL events are committed in the same transaction. Existing version 3 jobs keep their prior runner and event history.
+
+## Configuration
+
+Relevant `.env` settings:
+
+- `SEARCH_BATCH_SIZE=1000`
+- `SEARCH_RETRY_SECONDS=60`
+- `MAX_SEARCH_PAGES=0` (zero means unlimited pagination)
+- `SEARXNG_URL`, `SEARCH_TIMEOUT`
+- `FIRECRAWL_URL`, `CRAWL_TIMEOUT`, `MAX_CRAWL_PAGES`, `MAX_CRAWL_DEPTH`
+- `MAX_CONCURRENT_SITES` (new jobs crawl one URL at a time)
+- `JOB_DB_PATH`, `JOB_TTL_SECONDS`, `JOB_CLEANUP_INTERVAL`
+
+The application supplies defaults; no `.env` edit is required unless you want to change batch size or retry delay.
 
 ## Tests
 
-Offline tests use deterministic fixtures and mocks:
+Offline unit and integration tests:
 
 ```bash
 /opt/business-discovery/.venv/bin/python -m unittest discover -s /opt/business-discovery/tests -v
 ```
 
-Live smoke test validates the deployed API, real SearXNG/Firecrawl path, flat records, and SSE:
+The live smoke test consumes SSE while the job runs and sends `true` for every `url_completed` event. It should only be run against an intentional test environment because it starts real SearXNG and Firecrawl work.
 
-```bash
-/opt/business-discovery/.venv/bin/python /opt/business-discovery/test_service.py
-```
+## Deployment
 
-Optional live-test variables: `TEST_BASE_URL`, `TEST_KEYWORD`, `TEST_PROVINCE`, `TEST_COUNT`, and `TEST_JOB_TIMEOUT_SECONDS`.
-
-## Deployment note
-
-This code update intentionally does not restart or deploy the running service. After review, deployment commands are:
-
-```bash
-sudo systemctl restart business-discovery
-sudo systemctl status business-discovery --no-pager
-curl --fail http://127.0.0.1:8091/health
-```
+Code changes do not restart or deploy the service automatically. Public access and service restart remain separate operational steps.

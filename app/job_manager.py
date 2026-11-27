@@ -9,6 +9,7 @@ import math
 import os
 import time
 import uuid
+from email.utils import parsedate_to_datetime
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
 
@@ -32,6 +33,8 @@ class JobManager:
         url_factor: float = 1.6,
         max_search_pages: int = 50,
         cleanup_interval: int = 3600,
+        search_batch_size: int = 1000,
+        search_retry_seconds: int = 60,
     ):
         self.store = store
         self.search_fn = search_fn
@@ -43,7 +46,10 @@ class JobManager:
         self.url_factor = url_factor
         self.max_search_pages = max_search_pages
         self.cleanup_interval = cleanup_interval
+        self.search_batch_size = max(1, search_batch_size)
+        self.search_retry_seconds = max(1, search_retry_seconds)
         self.tasks: dict[str, asyncio.Task] = {}
+        self.decision_events: dict[str, asyncio.Event] = {}
         self.cleanup_task: asyncio.Task | None = None
         self.site_semaphore: asyncio.Semaphore | None = None
         self.lock_file = None
@@ -72,7 +78,7 @@ class JobManager:
         self.stopping = True
         active = list(self.tasks.values())
         for job_id in list(self.tasks):
-            self.store.request_stop(job_id)
+            self.decision_events.setdefault(job_id, asyncio.Event()).set()
         if active:
             await asyncio.gather(*active, return_exceptions=True)
         if self.cleanup_task:
@@ -96,26 +102,53 @@ class JobManager:
                 log.exception("Job cleanup failed")
 
     def _spawn(self, job_id: str) -> None:
-        if job_id in self.tasks or self.stopping:
+        existing = self.tasks.get(job_id)
+        if existing and not existing.done():
+            return
+        if existing and existing.done():
+            self.tasks.pop(job_id, None)
+        if self.stopping:
             return
         task = asyncio.create_task(self._run(job_id), name=f"discovery-{job_id}")
         self.tasks[job_id] = task
-        task.add_done_callback(lambda _: self.tasks.pop(job_id, None))
+        task.add_done_callback(lambda finished: self.tasks.pop(job_id, None) if self.tasks.get(job_id) is finished else None)
+
+    def _queries_for(self, keyword: str, province: str) -> list[str]:
+        queries = []
+        for index in range(1, 65):
+            query = self.query_fn(keyword, province, index).strip()
+            if query and query not in queries:
+                queries.append(query)
+        return queries
 
     def submit(self, keyword: str, province: str, count: int | None, idempotency_key: str | None = None) -> tuple[dict, bool]:
         self.store.cleanup_expired()
         job_id = uuid.uuid4().hex
         state = {
             "schema_version": 2,
-            "job_model_version": 3,
+            "job_model_version": 4,
             "job_id": job_id,
             "status": "queued",
             "keyword": keyword,
             "province": province,
             "requested_count": count,
-            "mode": "limited" if count is not None else "unlimited",
+            "mode": "approval_controlled",
             "stop_requested": False,
             "active_urls": [],
+            "search_batch_size": self.search_batch_size,
+            "batch_number": 0,
+            "batch_urls": [],
+            "batch_index": 0,
+            "url_queue": [],
+            "seen_urls": [],
+            "query_index": 0,
+            "search_queries": self._queries_for(keyword, province),
+            "query_states": {},
+            "search_exhausted": False,
+            "search_retry_at": None,
+            "pending_decision_id": None,
+            "decisions": {},
+            "active_url": None,
             "current_round": 0,
             "total_rounds": self.max_rounds,
             "round_url_target": 0,
@@ -126,7 +159,7 @@ class JobManager:
             "discovered_in_round": 0,
             "processed_in_round": 0,
             "remaining_in_round": 0,
-            "current_stage": "queued",
+            "current_stage": "searching",
             "page_statuses": {},
             "errors": [],
             "warnings": [],
@@ -174,6 +207,14 @@ class JobManager:
             "successful_results": len(state["results"]),
             "total_unique_mobile_numbers": len(state["registered_numbers"]),
             "current_stage": state["current_stage"],
+            "batch_number": state.get("batch_number", state.get("current_round", 0)),
+            "batch_size": state.get("search_batch_size"),
+            "queued_url_count": len(state.get("url_queue", [])),
+            "seen_url_count": len(state.get("seen_urls", [])),
+            "current_batch_index": state.get("batch_index", 0),
+            "current_batch_url_count": len(state.get("batch_urls", [])),
+            "pending_decision_id": state.get("pending_decision_id"),
+            "active_url": state.get("active_url"),
             "page_statuses": state["page_statuses"],
             "errors": state["errors"],
             "warnings": state["warnings"],
@@ -195,6 +236,8 @@ class JobManager:
             "requested_count": status["requested_count"],
             "mode": status["mode"],
             "stop_requested": status["stop_requested"],
+            "batch_number": status.get("batch_number", 0),
+            "batch_size": status.get("batch_size"),
             "successful_results": status["successful_results"],
             "total_unique_mobile_numbers": status["total_unique_mobile_numbers"],
             "discovered_page_count": status["discovered_page_count"],
@@ -207,6 +250,203 @@ class JobManager:
         }
 
     async def _run(self, job_id: str) -> None:
+        record = self.store.get(job_id)
+        if record and int(record["state"].get("job_model_version", 3)) >= 4:
+            await self._run_approval_job(job_id)
+        else:
+            await self._run_legacy(job_id)
+
+    async def _run_approval_job(self, job_id: str) -> None:
+        try:
+            if not self.store.claim(job_id):
+                return
+            while True:
+                if self.stopping:
+                    return
+                record = self.store.get(job_id)
+                if record is None or record["status"] in TERMINAL:
+                    return
+                state = record["state"]
+                if state.get("stop_requested"):
+                    self._finish_approval_job(job_id, "stopped", "stop_requested")
+                    return
+                stage = state["current_stage"]
+                if stage == "awaiting_approval":
+                    event = self.decision_events.setdefault(job_id, asyncio.Event())
+                    event.clear()
+                    current = self.store.get(job_id)
+                    if current is None or current["status"] in TERMINAL:
+                        return
+                    if current["state"].get("pending_decision_id"):
+                        await event.wait()
+                    continue
+                if stage == "searching":
+                    if len(state["url_queue"]) >= state["search_batch_size"] or state["search_exhausted"]:
+                        batch = self.store.freeze_batch(job_id)
+                        if batch:
+                            continue
+                        latest = self.store.get(job_id)
+                        if latest and latest["state"].get("search_exhausted") and not latest["state"].get("url_queue"):
+                            self._finish_approval_job(job_id, "completed", "search_exhausted")
+                            return
+                    await self._search_for_batch(job_id)
+                    continue
+                if stage == "crawling":
+                    candidate = self.store.start_sequential_url(job_id)
+                    if candidate is None:
+                        continue
+                    try:
+                        page_result = await self.process_fn(candidate, self.site_semaphore)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        page_result = {"pages": [], "error": str(exc)[:500]}
+                    records = self._records_for_url(candidate, page_result)
+                    self.store.complete_sequential_url(
+                        job_id, candidate, records,
+                        str(page_result.get("error"))[:500] if page_result.get("error") else None,
+                        f"/v1/jobs/{job_id}/decisions",
+                    )
+                    continue
+                if stage in {"completed", "failed", "stopped"}:
+                    return
+                raise RuntimeError(f"Unexpected approval job stage: {stage}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("Approval-controlled discovery job %s failed", job_id)
+            record = self.store.get(job_id)
+            if record and record["status"] not in TERMINAL:
+                state = record["state"]
+                state["errors"].append({"stage": state.get("current_stage"), "message": str(exc)[:500]})
+                state["current_stage"] = "failed"
+                self.store.save(job_id, state, status="failed", event=("job_failed", self._summary(state, error=str(exc))))
+
+    async def _search_for_batch(self, job_id: str) -> None:
+        record = self.store.get(job_id)
+        if record is None:
+            return
+        state = record["state"]
+        if state.get("stop_requested") or state.get("search_exhausted"):
+            return
+        query_index = int(state["query_index"])
+        queries = state["search_queries"]
+        if query_index >= len(queries):
+            state["search_exhausted"] = True
+            self.store.save(job_id, state, event=("search_exhausted", {"query_count": len(queries)}))
+            return
+        query = queries[query_index]
+        cursor = state["query_states"].get(query, {"next_page": 1, "exhausted": False})
+        if cursor.get("exhausted"):
+            self.store.mark_query_exhausted(job_id, query)
+            return
+        retry_at = state.get("search_retry_at")
+        if retry_at and retry_at > time.time():
+            event = self.decision_events.setdefault(job_id, asyncio.Event())
+            event.clear()
+            current = self.store.get(job_id)
+            if current is None or current["state"].get("stop_requested") or self.stopping:
+                return
+            try:
+                await asyncio.wait_for(event.wait(), timeout=max(0.0, retry_at - time.time()))
+            except asyncio.TimeoutError:
+                pass
+            return
+        needed = max(1, int(state["search_batch_size"]) - len(state["url_queue"]))
+
+        async def page_checkpoint(next_page: int, new_pages: list[dict], exhausted: bool) -> bool:
+            current = self.store.get(job_id)
+            if not current or current["state"].get("stop_requested") or self.stopping:
+                return False
+            self.store.record_search_page(job_id, query, next_page, new_pages, exhausted)
+            return True
+
+        try:
+            await self.search_fn(
+                state["keyword"], state["province"], needed,
+                excluded_urls=set(state["seen_urls"]), round_number=query_index + 1,
+                start_page=int(cursor.get("next_page", 1)), initial_sites=[],
+                page_callback=page_checkpoint, max_pages=0,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self.store.get(job_id)["state"].get("stop_requested"):
+                return
+            retry_after = getattr(exc, "retry_after", None)
+            if retry_after is None:
+                response = getattr(exc, "response", None)
+                header = response.headers.get("Retry-After") if response is not None else None
+                if header:
+                    try:
+                        retry_after = max(0.0, float(header))
+                    except ValueError:
+                        try:
+                            retry_after = max(0.0, parsedate_to_datetime(header).timestamp() - time.time())
+                        except (TypeError, ValueError, OverflowError):
+                            retry_after = None
+            delay = max(0.0, float(retry_after)) if retry_after is not None else float(self.search_retry_seconds)
+            self.store.set_search_retry(job_id, time.time() + delay, str(exc))
+            event = self.decision_events.setdefault(job_id, asyncio.Event())
+            event.clear()
+            current = self.store.get(job_id)
+            if current is None or current["state"].get("stop_requested") or self.stopping:
+                return
+            try:
+                await asyncio.wait_for(event.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+            return
+        latest = self.store.get(job_id)
+        if latest is None:
+            return
+        query_state = latest["state"]["query_states"].get(query, {})
+        if query_state.get("exhausted"):
+            self.store.mark_query_exhausted(job_id, query)
+
+    def _records_for_url(self, candidate: dict, page_result: dict) -> list[dict]:
+        pages = page_result.get("pages") or []
+        if not pages and isinstance(page_result.get("phones"), dict):
+            pages = [{"source_url": candidate["url"], "website_url": candidate.get("website_url"),
+                      "page_title": "", "page_description": "", "numbers": list(page_result["phones"]),
+                      "phone_sources": page_result["phones"]}]
+        records = []
+        for page_data in sorted(pages, key=lambda item: str(item.get("source_url", ""))):
+            source_url = str(page_data.get("source_url") or candidate["url"])
+            parts = urlsplit(source_url)
+            if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
+                continue
+            website_url = str(page_data.get("website_url") or candidate.get("website_url") or f"{parts.scheme}://{parts.netloc}/")
+            phone_sources = page_data.get("phone_sources") or {}
+            for raw in sorted(set(page_data.get("numbers") or [])):
+                number = self.normalize_phone_fn(str(raw))
+                if not number:
+                    continue
+                records.append({"number": number, "source_url": str(phone_sources.get(number) or source_url),
+                    "website_url": website_url, "page_title": str(page_data.get("page_title") or ""),
+                    "page_description": str(page_data.get("page_description") or "")})
+        return records
+
+    def _finish_approval_job(self, job_id: str, status: str, reason: str) -> None:
+        record = self.store.get(job_id)
+        if not record:
+            return
+        state = record["state"]
+        state["status"] = state["current_stage"] = status
+        state["pending_decision_id"] = None
+        if status == "completed" and reason == "search_exhausted":
+            state.setdefault("warnings", []).append({"message": "All configured search queries were exhausted and the URL queue is empty."})
+        self.store.save(job_id, state, status=status, event=("job_" + status, {
+            "job_id": job_id, "status": status, "reason": reason,
+            "successful_results": len(state["results"]), "processed_page_count": state["processed_page_count"],
+        }))
+
+    def decide(self, job_id: str, decision_id: str, decision: bool) -> dict:
+        result = self.store.resolve_decision(job_id, decision_id, decision)
+        self.decision_events.setdefault(job_id, asyncio.Event()).set()
+        return result
+
+    async def _run_legacy(self, job_id: str) -> None:
         try:
             if not self.store.claim(job_id):
                 return
@@ -504,7 +744,10 @@ class JobManager:
         self.store.save(job_id, state, status=status, event=(event_type, self._summary(state)))
 
     def request_stop(self, job_id: str) -> dict | None:
-        return self.store.request_stop(job_id)
+        outcome = self.store.request_stop(job_id)
+        if outcome is not None:
+            self.decision_events.setdefault(job_id, asyncio.Event()).set()
+        return outcome
 
     @staticmethod
     def _update_round_counts(state: dict) -> None:
