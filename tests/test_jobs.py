@@ -25,6 +25,73 @@ def extracted_page(url, numbers, title="", description=""):
 
 
 class PaginationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_persian_search_uses_configured_language_and_records_url_diagnostics(self):
+        request_params = []
+        class Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): return None
+            async def get(self, url, params):
+                request_params.append(dict(params))
+                return httpx.Response(200, json={"results": [
+                    {"url": "https://market.ir/item/1?utm_source=x"},
+                    {"url": "https://www.market.ir/item/1"},
+                    {"url": "https://foreign.example.com/item/1"},
+                    {"url": "ftp://market.ir/file"},
+                    {"title": "missing URL"},
+                ]}, request=httpx.Request("GET", url))
+        checkpoints = []
+        async def checkpoint(next_page, pages, exhausted, diagnostics=None):
+            checkpoints.append((next_page, pages, diagnostics))
+        with patch("app.main.httpx.AsyncClient", return_value=Client()), patch("app.main.SEARXNG_LANGUAGE", "en-US"):
+            pages = await main.search_sites("موبایل", "اصفهان", 10, page_callback=checkpoint, max_pages=1)
+        self.assertEqual(request_params[0]["language"], "en-US")
+        self.assertIn("site:.ir", request_params[0]["q"])
+        self.assertEqual(len(pages), 1)
+        diagnostics = checkpoints[0][2]
+        self.assertEqual(diagnostics["raw_result_count"], 5)
+        self.assertEqual(diagnostics["results_with_url"], 4)
+        self.assertEqual(diagnostics["valid_url_count"], 2)
+        self.assertEqual(diagnostics["new_url_count"], 1)
+        self.assertEqual(diagnostics["duplicate_url_count"], 1)
+        self.assertEqual(diagnostics["rejected_reasons"], {
+            "non_iranian_domain": 1, "unsupported_scheme": 1, "missing_url": 1,
+        })
+
+    async def test_empty_json_with_all_engines_unresponsive_retries_instead_of_exhausting(self):
+        class Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): return None
+            async def get(self, url, params):
+                return httpx.Response(200, json={"results": [], "unresponsive_engines": [
+                    ["google cse", "Suspended: too many requests"], ["duckduckgo", "CAPTCHA"],
+                ]}, request=httpx.Request("GET", url))
+        with patch("app.main.httpx.AsyncClient", return_value=Client()):
+            with self.assertRaises(main.SearchProviderError) as caught:
+                await main.search_sites("mobile", "Isfahan", 1000)
+        self.assertEqual(caught.exception.http_status, 200)
+        self.assertIn("unresponsive", str(caught.exception))
+        self.assertFalse(caught.exception.diagnostics.get("exhausted", False))
+
+    async def test_identical_consecutive_search_pages_are_detected_as_pagination_end(self):
+        requested = []
+        checkpoints = []
+        class Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): return None
+            async def get(self, url, params):
+                requested.append(params["pageno"])
+                return httpx.Response(200, json={"results": [{"url": "https://market.ir/only-result"}]},
+                    request=httpx.Request("GET", url))
+        async def checkpoint(next_page, pages, exhausted, diagnostics=None):
+            checkpoints.append(diagnostics)
+        with patch("app.main.httpx.AsyncClient", return_value=Client()):
+            pages = await main.search_sites("shop", "Iran", 100, page_callback=checkpoint, max_pages=0)
+        self.assertEqual(requested, [1, 2])
+        self.assertEqual(len(pages), 1)
+        self.assertFalse(checkpoints[0]["exhausted"])
+        self.assertTrue(checkpoints[1]["exhausted"])
+        self.assertTrue(checkpoints[1]["repeated_page"])
+
     async def test_unbounded_page_mode_continues_past_legacy_fifty_page_limit(self):
         requested = []
         class Client:
@@ -54,7 +121,7 @@ class PaginationTests(unittest.IsolatedAsyncioTestCase):
                 ] if page == 11 else [])
                 return httpx.Response(200, json={"results": entries}, request=httpx.Request("GET", url))
         checkpoints = []
-        async def checkpoint(next_page, pages, exhausted):
+        async def checkpoint(next_page, pages, exhausted, diagnostics=None):
             checkpoints.append((next_page, [item["url"] for item in pages], exhausted))
         with patch("app.main.httpx.AsyncClient", return_value=Client()):
             pages = await main.search_sites(
@@ -445,6 +512,37 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["status"], "completed")
         self.assertGreaterEqual(attempts, 2)
         self.assertTrue(any("SearXNG unavailable" in warning["message"] for warning in final["warnings"]))
+
+    async def test_unresponsive_engine_fallback_tries_next_local_query_before_waiting(self):
+        attempts = []
+        async def search(keyword, province, needed, excluded_urls, round_number, start_page,
+                         initial_sites, page_callback, max_pages):
+            attempts.append(round_number)
+            if round_number == 1:
+                raise main.SearchProviderError(
+                    "SearXNG engines unavailable", http_status=200,
+                    diagnostics={"provider_failure": True, "raw_result_count": 0},
+                )
+            page = candidate("https://market.ir/listing/1")
+            await page_callback(start_page + 1, [page], True, {"raw_result_count": 1, "valid_url_count": 1})
+            return [page]
+
+        self.manager.search_fn = search
+        self.manager.search_batch_size = 1
+        self.manager.search_queries_fn = lambda _keyword, _province: [
+            "فروشگاه اصفهان site:.ir", "فروشگاه اصفهان",
+        ]
+        self.auto_approve = False
+        job, _ = self.manager.submit("فروشگاه", "اصفهان", 1)
+        awaiting = await self.wait_approval(job["job_id"])
+        self.assertEqual(attempts[:2], [1, 2])
+        self.assertEqual(awaiting["successful_results"], 2)
+        self.assertEqual(awaiting["search_diagnostics"]["queries_attempted"], 2)
+        self.assertEqual(awaiting["search_diagnostics"]["queries_consumed"], 1)
+        self.assertTrue(any("engines unavailable" in warning["message"] for warning in awaiting["warnings"]))
+        self.manager.decide(job["job_id"], awaiting["pending_decision_id"], False)
+        final = await self.wait_terminal(job["job_id"])
+        self.assertEqual(final["status"], "stopped")
 
     async def test_search_exhaustion_completes_with_warning(self):
         async def empty_search(keyword, province, needed, excluded_urls, round_number, start_page, initial_sites, page_callback, max_pages):

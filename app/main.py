@@ -38,6 +38,7 @@ MAX_SEARCH_ROUNDS = 3  # Retained only by the legacy synchronous helper.
 SEARCH_BATCH_SIZE = max(1, int(os.getenv("SEARCH_BATCH_SIZE", "1000")))
 SEARCH_RETRY_SECONDS = max(1, int(os.getenv("SEARCH_RETRY_SECONDS", "60")))
 MAX_SEARCH_PAGES = int(os.getenv("MAX_SEARCH_PAGES", "0"))
+SEARXNG_LANGUAGE = os.getenv("SEARXNG_LANGUAGE", "en-US")
 JOB_DB_PATH = os.getenv("JOB_DB_PATH", "/opt/business-discovery/data/jobs.sqlite3")
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", str(7 * 24 * 60 * 60)))
 JOB_CLEANUP_INTERVAL = int(os.getenv("JOB_CLEANUP_INTERVAL", "3600"))
@@ -80,6 +81,7 @@ async def lifespan(app: FastAPI):
         max_search_pages=MAX_SEARCH_PAGES,
         search_batch_size=SEARCH_BATCH_SIZE,
         search_retry_seconds=SEARCH_RETRY_SECONDS,
+        search_queries_fn=search_queries_for_job,
         cleanup_interval=JOB_CLEANUP_INTERVAL,
     )
     await manager.start()
@@ -139,6 +141,46 @@ def normalize_url(value: str) -> str | None:
         return None
 
 
+def normalize_search_candidate(value: object, *, location_evidence: str = "", search_text: str = "") -> tuple[str | None, str | None]:
+    """Accept Iranian domains, or other domains whose indexed text names the requested location."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None, "missing_url"
+    try:
+        parsed = urlsplit(raw)
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return None, "unsupported_scheme"
+        if not parsed.hostname:
+            return None, "missing_hostname"
+        if parsed.username or parsed.password:
+            return None, "embedded_credentials"
+        try:
+            ip = ipaddress.ip_address(parsed.hostname)
+            if not ip.is_global:
+                return None, "non_public_ip"
+        except ValueError:
+            host = parsed.hostname.lower().rstrip(".")
+            if "." not in host or host in {"localhost", "example.com"}:
+                return None, "host_policy"
+            if not host.removeprefix("www.").endswith(".ir"):
+                key = lambda text: " ".join(str(text).casefold().replace("ي", "ی").replace("ك", "ک").replace("\u200c", " ").split())
+                location_key = key(location_evidence)
+                indexed_text = key(search_text)[:3000]
+                has_persian_text = any("\u0600" <= char <= "\u06ff" for char in indexed_text)
+                if not location_key or location_key not in indexed_text or not has_persian_text:
+                    return None, "non_iranian_domain"
+        else:
+            return None, "non_iranian_domain"
+        if parsed.port is not None and not (1 <= parsed.port <= 65535):
+            return None, "invalid_port"
+    except (ValueError, UnicodeError):
+        return None, "malformed_url"
+    normalized = normalize_url(raw)
+    if not normalized:
+        return None, "normalization_policy"
+    return normalized, None
+
+
 def domain_of(url: str) -> str:
     return (urlsplit(url).hostname or "").lower().removeprefix("www.")
 
@@ -154,27 +196,63 @@ def search_query_for_round(keyword: str, province: str, round_number: int) -> st
 
 
 def search_queries_for_job(keyword: str, province: str) -> list[str]:
-    base = [keyword, f'"{keyword}"']
-    local = [province, f'استان {province}', f'{province} ایران']
-    intents = ["", "شماره تماس", "موبایل", "تماس با ما", "فروشگاه", "خدمات", "نمایندگی", "آدرس تلفن"]
+    normalized_keyword = " ".join(keyword.casefold().split())
+    synonym_groups = {
+        "موبایل": ["تلفن همراه", "گوشی موبایل", "فروشگاه گوشی", "لوازم جانبی موبایل", "پاساژ موبایل", "mobile phone", "cell phone"],
+        "تلفن همراه": ["موبایل", "گوشی", "فروشگاه موبایل", "لوازم جانبی موبایل", "mobile phone", "cell phone"],
+        "رستوران": ["غذاخوری", "فست فود", "کافه رستوران", "restaurant", "food restaurant", "dining"],
+        "کلینیک": ["درمانگاه", "مرکز درمانی", "مطب", "clinic", "medical center", "healthcare"],
+        "پزشک": ["دکتر", "مطب", "کلینیک", "doctor", "physician", "medical clinic"],
+        "فروشگاه": ["مرکز خرید", "مغازه", "فروش", "shop", "store", "retail"],
+        "خدمات": ["مرکز خدمات", "شرکت خدماتی", "service center", "services", "provider"],
+        "mobile": ["mobile phone", "cell phone", "موبایل", "گوشی موبایل", "تلفن همراه", "mobile shop"],
+        "mobile phone": ["cell phone", "موبایل", "گوشی موبایل", "تلفن همراه", "mobile store"],
+        "restaurant": ["food restaurant", "dining", "رستوران", "غذاخوری", "فست فود", "کافه رستوران"],
+        "clinic": ["medical clinic", "medical center", "کلینیک", "درمانگاه", "مرکز درمانی"],
+    }
+    topic_terms = [keyword.strip(), *synonym_groups.get(normalized_keyword, [])]
+    locations = [province.strip(), f"استان {province.strip()}", f"{province.strip()} ایران"]
+    local_intents = ["فروشگاه", "مرکز", "تماس با ما", "آدرس", "وب‌سایت", "خرید", "نمایندگی", "شماره تماس"]
+    english_intents = ["store", "shop", "business", "contact", "address", "official website", "Iran", "phone"]
+    candidates = []
+    for location in locations:
+        candidates.extend(f"{topic} {location}" for topic in topic_terms)
+    for topic in topic_terms[:6]:
+        candidates.extend(f"{topic} {province.strip()} {intent} ایران" for intent in local_intents if intent)
+    candidates.extend(f"{keyword.strip()} {province.strip()} {intent}" for intent in english_intents)
+    candidates.extend(f"{keyword.strip()} {province.strip()} {intent}" for intent in ("ایران", "کسب و کار", "شرکت", "خدمات"))
+    english_topics = [topic for topic in topic_terms if any("a" <= char.casefold() <= "z" for char in topic)]
+    candidates.extend(f"{topic} {province.strip()} {intent}" for topic in english_topics for intent in english_intents)
+    candidates.extend((
+        f'"{keyword.strip()}" {province.strip()} Iran',
+        f'{keyword.strip()} {province.strip()} Iran contact',
+        f'{keyword.strip()} {province.strip()} website',
+    ))
+
     queries = []
-    for term in intents:
-        for phrase in base:
-            for location in local[:2]:
-                query = " ".join(part for part in (phrase, location, term, "ایران") if part)
-                if query not in queries:
-                    queries.append(query)
-    for term in ("شماره موبایل", "اطلاعات تماس", "خرید", "مرکز فروش"):
-        query = f"{keyword} {province} {term} ایران"
-        if query not in queries:
-            queries.append(query)
+    seen = set()
+    for query in candidates:
+        query = " ".join(query.split()).strip()
+        if not query:
+            continue
+        query_variants = [f"{query} site:.ir"]
+        if any("\u0600" <= char <= "\u06ff" for char in query):
+            query_variants.append(query)
+        for variant in query_variants:
+            key = variant.casefold().replace("ي", "ی").replace("ك", "ک")
+            if key not in seen:
+                queries.append(variant)
+                seen.add(key)
     return queries
 
 
 class SearchProviderError(RuntimeError):
-    def __init__(self, message: str, retry_after: float | None = None):
+    def __init__(self, message: str, retry_after: float | None = None, *, http_status: int | None = None,
+                 diagnostics: dict | None = None):
         super().__init__(message)
         self.retry_after = retry_after
+        self.http_status = http_status
+        self.diagnostics = diagnostics or {}
 
 
 async def search_sites(
@@ -187,10 +265,12 @@ async def search_sites(
     initial_sites: list[dict] | None = None,
     page_callback=None,
     max_pages: int | None = None,
+    language: str | None = None,
 ) -> list[dict]:
     excluded = {normalized for url in (excluded_urls or set()) if (normalized := normalize_url(url))}
     page_limit = (None if max_pages == 0 else max_pages) if max_pages is not None else (MAX_SEARCH_PAGES or None)
     query = search_query_for_round(keyword, province, round_number)
+    request_language = language or SEARXNG_LANGUAGE
     sites: dict[str, dict] = {}
     for site in initial_sites or []:
         normalized = normalize_url(str(site.get("url", "")))
@@ -202,11 +282,14 @@ async def search_sites(
 
     async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT, follow_redirects=True) as client:
         page_no = start_page
+        previous_fingerprint = None
         while page_limit is None or page_no <= page_limit:
+            requested_at = time.time()
+            response = None
             try:
                 response = await client.get(
                     f"{SEARXNG_URL.rstrip('/')}/search",
-                    params={"q": query, "format": "json", "language": "fa-IR", "pageno": page_no},
+                    params={"q": query, "format": "json", "language": request_language, "pageno": page_no},
                 )
                 response.raise_for_status()
                 payload = response.json()
@@ -224,16 +307,34 @@ async def search_sites(
                             retry_after = max(0.0, parsedate_to_datetime(response.headers.get("Retry-After", "")).timestamp() - time.time())
                         except (TypeError, ValueError, OverflowError):
                             pass
-                raise SearchProviderError(f"SearXNG request failed: {type(exc).__name__}", retry_after) from exc
+                http_status = getattr(response, "status_code", None)
+                raise SearchProviderError(f"SearXNG request failed: {type(exc).__name__}", retry_after,
+                    http_status=http_status, diagnostics={"requested_at": requested_at, "page": page_no,
+                    "language": request_language, "error_type": type(exc).__name__}) from exc
+
+            raw_url_count = 0
+            valid_url_count = 0
+            rejected: dict[str, int] = {}
+            duplicate_count = 0
 
             new_sites: list[dict] = []
             for item in items:
                 if not isinstance(item, dict):
+                    rejected["invalid_result_shape"] = rejected.get("invalid_result_shape", 0) + 1
                     continue
-                normalized = normalize_url(str(item.get("url", "")))
+                raw_value = item.get("url")
+                if raw_value:
+                    raw_url_count += 1
+                indexed_text = " ".join(str(item.get(field, "")) for field in ("title", "content", "description"))
+                normalized, reason = normalize_search_candidate(
+                    raw_value, location_evidence=province, search_text=indexed_text,
+                )
                 if not normalized:
+                    rejected[reason or "invalid_url"] = rejected.get(reason or "invalid_url", 0) + 1
                     continue
+                valid_url_count += 1
                 if normalized in excluded or normalized in sites:
+                    duplicate_count += 1
                     continue
                 site = {
                     "url": normalized,
@@ -243,9 +344,33 @@ async def search_sites(
                 sites[normalized] = site
                 new_sites.append(site)
 
-            exhausted = len(items) == 0
+            fingerprint = tuple(str(item.get("url", "")) for item in items if isinstance(item, dict))
+            repeated_page = bool(fingerprint) and fingerprint == previous_fingerprint
+            previous_fingerprint = fingerprint if fingerprint else None
+            exhausted = len(items) == 0 or repeated_page
+            unresponsive = payload.get("unresponsive_engines", [])
+            if not items and unresponsive:
+                detail = "; ".join(
+                    f"{entry[0]}: {entry[1]}" for entry in unresponsive[:5]
+                    if isinstance(entry, (list, tuple)) and len(entry) >= 2
+                )
+                raise SearchProviderError(
+                    "SearXNG returned no results while engines were unresponsive" + (f" ({detail})" if detail else ""),
+                    http_status=response.status_code,
+                    diagnostics={"requested_at": requested_at, "page": page_no, "http_status": response.status_code,
+                        "raw_result_count": 0, "unresponsive_engines": unresponsive[:10],
+                        "language": request_language, "provider_failure": True},
+                )
+            diagnostics = {
+                "requested_at": requested_at, "page": page_no, "http_status": response.status_code,
+                "language": request_language, "raw_result_count": len(items), "results_with_url": raw_url_count,
+                "valid_url_count": valid_url_count, "new_url_count": len(new_sites),
+                "duplicate_url_count": duplicate_count, "rejected_url_count": sum(rejected.values()),
+                "rejected_reasons": rejected, "unresponsive_engines": unresponsive[:10] if isinstance(unresponsive, list) else [],
+                "next_page": page_no + 1, "exhausted": exhausted, "repeated_page": repeated_page,
+            }
             if page_callback:
-                keep_searching = await page_callback(page_no + 1, new_sites, exhausted)
+                keep_searching = await page_callback(page_no + 1, new_sites, exhausted, diagnostics)
                 if keep_searching is False:
                     break
             if (needed is not None and len(sites) >= needed) or exhausted:

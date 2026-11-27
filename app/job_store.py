@@ -475,12 +475,14 @@ class JobStore:
             now = time.time()
             if status == "queued":
                 state["status"] = state["current_stage"] = "stopped"
+                state["completion_reason"] = "stop_requested"
                 connection.execute("UPDATE jobs SET status='stopped',state_json=?,updated_at=? WHERE job_id=?", (self._json(state), now, job_id))
                 self._append_event(connection, job_id, "job_stopped", {"job_id": job_id, "status": "stopped", **self._state_summary(state)})
                 status = "stopped"
             else:
                 if int(state.get("job_model_version", 3)) >= 4 and state.get("current_stage") == "awaiting_approval":
                     state["status"] = state["current_stage"] = "stopped"
+                    state["completion_reason"] = "stop_requested"
                     state["pending_decision_id"] = None
                     connection.execute("UPDATE jobs SET status='stopped',state_json=?,updated_at=? WHERE job_id=?", (self._json(state), now, job_id))
                     self._append_event(connection, job_id, "job_stopped", {"job_id": job_id, "status": "stopped", "reason": "stop_requested"})
@@ -513,7 +515,8 @@ class JobStore:
             "processed_in_round": state["processed_in_round"], "remaining_in_round": state["remaining_in_round"],
             "successful_results": len(state["results"]), "requested_count": state["requested_count"]}
 
-    def record_search_page(self, job_id: str, query: str, next_page: int, candidates: list[dict], exhausted: bool) -> dict:
+    def record_search_page(self, job_id: str, query: str, next_page: int, candidates: list[dict], exhausted: bool,
+                           diagnostics: dict | None = None) -> dict:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -540,6 +543,23 @@ class JobStore:
             state["seen_urls"] = sorted(seen)
             query_state = state["query_states"].setdefault(query, {})
             query_state.update({"next_page": next_page, "exhausted": bool(exhausted)})
+            query_state["status"] = "exhausted" if exhausted else "active"
+            page_diagnostic = dict(diagnostics or {})
+            page_diagnostic.update({"next_page": next_page, "new_url_count": len(added),
+                                    "queue_url_count": len(state["url_queue"]), "exhausted": bool(exhausted)})
+            recent = query_state.setdefault("recent_pages", [])
+            recent.append(page_diagnostic)
+            query_state["recent_pages"] = recent[-100:]
+            totals = query_state.setdefault("totals", {"pages": 0, "raw_results": 0, "valid_urls": 0,
+                "new_urls": 0, "duplicate_urls": 0, "rejected_urls": 0})
+            totals["pages"] += 1
+            for target, source in (("raw_results", "raw_result_count"), ("valid_urls", "valid_url_count"),
+                                   ("new_urls", "new_url_count"), ("duplicate_urls", "duplicate_url_count"),
+                                   ("rejected_urls", "rejected_url_count")):
+                totals[target] += int(page_diagnostic.get(source, 0) or 0)
+            query_state["last_error"] = None
+            query_state["retry_at"] = None
+            state["provider_failure_queries"] = []
             state["discovered_page_count"] += len(added)
             state["search_exhausted"] = False
             state["search_retry_at"] = None
@@ -548,6 +568,7 @@ class JobStore:
             self._append_event(connection, job_id, "search_progress", {
                 "query": query, "search_page_consumed": next_page - 1, "new_urls": len(added),
                 "queued_urls": len(state["url_queue"]), "search_batch_size": state["search_batch_size"],
+                "diagnostics": page_diagnostic,
             })
             connection.commit()
             return state
@@ -566,8 +587,14 @@ class JobStore:
                 raise KeyError(job_id)
             state = json.loads(row["state_json"])
             state["query_states"].setdefault(query, {}).update({"exhausted": True})
-            state["query_index"] += 1
-            state["search_exhausted"] = state["query_index"] >= len(state["search_queries"])
+            state["query_states"][query]["status"] = "exhausted"
+            queries = state.get("search_queries", [])
+            current_index = queries.index(query) if query in queries else int(state.get("query_index", 0))
+            pending = [index for index, item in enumerate(queries)
+                       if not state.get("query_states", {}).get(item, {}).get("exhausted")]
+            later = [index for index in pending if index > current_index]
+            state["query_index"] = (later or pending or [len(queries)])[0]
+            state["search_exhausted"] = not pending
             connection.execute("UPDATE jobs SET state_json=?,updated_at=? WHERE job_id=?", (self._json(state), time.time(), job_id))
             self._append_event(connection, job_id, "search_query_exhausted", {
                 "query": query, "query_index": state["query_index"],
@@ -581,7 +608,10 @@ class JobStore:
         finally:
             connection.close()
 
-    def set_search_retry(self, job_id: str, retry_at: float, error: str) -> None:
+    def set_search_retry(self, job_id: str, retry_at: float, error: str, *, http_status: int | None = None,
+                         diagnostics: dict | None = None, failed_query: str | None = None,
+                         next_query_index: int | None = None,
+                         provider_failure_queries: list[str] | None = None) -> None:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -591,7 +621,20 @@ class JobStore:
             state = json.loads(row["state_json"])
             state["search_retry_at"] = retry_at
             state["last_search_error"] = error[:500]
-            warning = {"stage": "searching", "message": error[:500], "retry_at": retry_at}
+            if next_query_index is not None:
+                state["query_index"] = next_query_index
+            if provider_failure_queries is not None:
+                state["provider_failure_queries"] = provider_failure_queries
+            query = failed_query
+            if query is None and state.get("query_index", 0) < len(state.get("search_queries", [])):
+                query = state["search_queries"][state["query_index"]]
+            if query is not None:
+                query_state = state["query_states"].setdefault(query, {"next_page": 1, "exhausted": False})
+                query_state.update({"status": "retry_wait", "retry_at": retry_at, "last_error": error[:500],
+                                    "last_http_status": http_status, "last_error_diagnostics": diagnostics or {}})
+            warning = {"stage": "searching", "message": error[:500], "retry_at": retry_at,
+                       "http_status": http_status, "query_index": state.get("query_index"),
+                       "diagnostics": diagnostics or {}}
             state.setdefault("warnings", []).append(warning)
             connection.execute("UPDATE jobs SET state_json=?,updated_at=? WHERE job_id=?", (self._json(state), time.time(), job_id))
             self._append_event(connection, job_id, "warning", warning)
@@ -789,6 +832,7 @@ class JobStore:
                 state["stop_requested"] = True
                 state["status"] = "stopped"
                 state["current_stage"] = "stopped"
+                state["completion_reason"] = "external_approval_declined"
                 status = "stopped"
             now = time.time()
             connection.execute("UPDATE jobs SET status=?,state_json=?,updated_at=?,expires_at=? WHERE job_id=?",

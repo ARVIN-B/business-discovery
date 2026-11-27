@@ -9,6 +9,7 @@ from app.main import (
     extract_mobile_numbers,
     firecrawl_crawl,
     normalize_mobile,
+    normalize_search_candidate,
     normalize_url,
     process_site,
     run_discovery,
@@ -129,6 +130,35 @@ class SearchPageTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(queries), 25)
         self.assertEqual(len(queries), len(set(queries)))
 
+    def test_search_strategy_expands_common_topics_in_persian_and_english(self):
+        queries = search_queries_for_job("موبایل", "اصفهان")
+        self.assertGreater(len(queries), 36)
+        self.assertIn("تلفن همراه اصفهان site:.ir", queries)
+        self.assertIn("تلفن همراه اصفهان", queries)
+        self.assertTrue(any("mobile phone" in query for query in queries))
+        self.assertTrue(any("پاساژ موبایل" in query for query in queries))
+        self.assertTrue(any(query.endswith("site:.ir") for query in queries))
+
+    def test_search_candidates_are_limited_to_iranian_domains(self):
+        accepted, reason = normalize_search_candidate("https://shop.example.ir/item/1")
+        self.assertEqual(accepted, "https://shop.example.ir/item/1")
+        self.assertIsNone(reason)
+        rejected, reason = normalize_search_candidate("https://foreign.example.com/item/1")
+        self.assertIsNone(rejected)
+        self.assertEqual(reason, "non_iranian_domain")
+        rejected, reason = normalize_search_candidate(
+            "https://foreign.example.com/item/1", location_evidence="Isfahan",
+            search_text="Online shop based in Isfahan",
+        )
+        self.assertIsNone(rejected)
+        self.assertEqual(reason, "non_iranian_domain")
+        local, reason = normalize_search_candidate(
+            "https://esfahanphone.com/mobile", location_evidence="اصفهان",
+            search_text="فروشگاه موبایل اصفهان - ارسال در شهر اصفهان",
+        )
+        self.assertEqual(local, "https://esfahanphone.com/mobile")
+        self.assertIsNone(reason)
+
     async def test_accepts_many_same_domain_urls_and_deduplicates_complete_normalized_url(self):
         response = httpx.Response(200, json={"results": [
             {"url": "https://www.divar.ir/v/1?utm_source=x&city=esfahan"},
@@ -175,12 +205,12 @@ class SearchPageTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *args): return None
             async def get(self, _url, params):
                 pages_requested.append(params["pageno"])
-                items = [{"url": f"https://torob.com/p/{params['pageno']}-{i}"} for i in range(3)] if params["pageno"] == 1 else []
+                items = [{"url": f"https://divar.ir/p/{params['pageno']}-{i}"} for i in range(3)] if params["pageno"] == 1 else []
                 return httpx.Response(200, json={"results": items}, request=httpx.Request("GET", _url))
 
         callbacks = []
-        async def checkpoint(next_page, pages, exhausted):
-            callbacks.append((next_page, [page["url"] for page in pages], exhausted))
+        async def checkpoint(next_page, pages, exhausted, diagnostics=None):
+            callbacks.append((next_page, [page["url"] for page in pages], exhausted, diagnostics))
 
         with patch("app.main.httpx.AsyncClient", return_value=Client()):
             found = await search_sites("محصول", "ایران", 3, page_callback=checkpoint, max_pages=4)

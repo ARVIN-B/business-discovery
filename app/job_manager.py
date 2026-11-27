@@ -35,6 +35,7 @@ class JobManager:
         cleanup_interval: int = 3600,
         search_batch_size: int = 1000,
         search_retry_seconds: int = 60,
+        search_queries_fn: Callable[[str, str], list[str]] | None = None,
     ):
         self.store = store
         self.search_fn = search_fn
@@ -48,6 +49,7 @@ class JobManager:
         self.cleanup_interval = cleanup_interval
         self.search_batch_size = max(1, search_batch_size)
         self.search_retry_seconds = max(1, search_retry_seconds)
+        self.search_queries_fn = search_queries_fn
         self.tasks: dict[str, asyncio.Task] = {}
         self.decision_events: dict[str, asyncio.Event] = {}
         self.cleanup_task: asyncio.Task | None = None
@@ -114,11 +116,16 @@ class JobManager:
         task.add_done_callback(lambda finished: self.tasks.pop(job_id, None) if self.tasks.get(job_id) is finished else None)
 
     def _queries_for(self, keyword: str, province: str) -> list[str]:
+        if self.search_queries_fn is not None:
+            return list(dict.fromkeys(query.strip() for query in self.search_queries_fn(keyword, province) if query.strip()))
         queries = []
-        for index in range(1, 65):
+        for index in range(1, 513):
             query = self.query_fn(keyword, province, index).strip()
-            if query and query not in queries:
-                queries.append(query)
+            if not query:
+                break
+            if query in queries:
+                break
+            queries.append(query)
         return queries
 
     def submit(self, keyword: str, province: str, count: int | None, idempotency_key: str | None = None) -> tuple[dict, bool]:
@@ -144,6 +151,7 @@ class JobManager:
             "query_index": 0,
             "search_queries": self._queries_for(keyword, province),
             "query_states": {},
+            "provider_failure_queries": [],
             "search_exhausted": False,
             "search_retry_at": None,
             "pending_decision_id": None,
@@ -185,6 +193,7 @@ class JobManager:
 
     def _public_state(self, record: dict) -> dict:
         state = record["state"]
+        search_diagnostics = self._search_diagnostics(state)
         return {
             "schema_version": 2,
             "job_id": record["job_id"],
@@ -215,6 +224,15 @@ class JobManager:
             "current_batch_url_count": len(state.get("batch_urls", [])),
             "pending_decision_id": state.get("pending_decision_id"),
             "active_url": state.get("active_url"),
+            "reason": state.get("completion_reason"),
+            "search_diagnostics": search_diagnostics,
+            "query_diagnostics": {
+                query: {"status": value.get("status", "pending"), "next_page": value.get("next_page", 1),
+                    "exhausted": bool(value.get("exhausted")), "totals": value.get("totals", {}),
+                    "last_page": (value.get("recent_pages") or [None])[-1],
+                    "last_error": value.get("last_error"), "retry_at": value.get("retry_at")}
+                for query, value in state.get("query_states", {}).items()
+            },
             "page_statuses": state["page_statuses"],
             "errors": state["errors"],
             "warnings": state["warnings"],
@@ -238,6 +256,9 @@ class JobManager:
             "stop_requested": status["stop_requested"],
             "batch_number": status.get("batch_number", 0),
             "batch_size": status.get("batch_size"),
+            "reason": status.get("reason"),
+            "search_diagnostics": status.get("search_diagnostics"),
+            "query_diagnostics": status.get("query_diagnostics"),
             "successful_results": status["successful_results"],
             "total_unique_mobile_numbers": status["total_unique_mobile_numbers"],
             "discovered_page_count": status["discovered_page_count"],
@@ -354,11 +375,11 @@ class JobManager:
             return
         needed = max(1, int(state["search_batch_size"]) - len(state["url_queue"]))
 
-        async def page_checkpoint(next_page: int, new_pages: list[dict], exhausted: bool) -> bool:
+        async def page_checkpoint(next_page: int, new_pages: list[dict], exhausted: bool, diagnostics: dict | None = None) -> bool:
             current = self.store.get(job_id)
             if not current or current["state"].get("stop_requested") or self.stopping:
                 return False
-            self.store.record_search_page(job_id, query, next_page, new_pages, exhausted)
+            self.store.record_search_page(job_id, query, next_page, new_pages, exhausted, diagnostics)
             return True
 
         try:
@@ -386,7 +407,34 @@ class JobManager:
                         except (TypeError, ValueError, OverflowError):
                             retry_after = None
             delay = max(0.0, float(retry_after)) if retry_after is not None else float(self.search_retry_seconds)
-            self.store.set_search_retry(job_id, time.time() + delay, str(exc))
+            error_diagnostics = getattr(exc, "diagnostics", None) or {}
+            failed_query = None
+            next_query_index = None
+            provider_failure_queries = None
+            if error_diagnostics.get("provider_failure"):
+                latest_state = self.store.get(job_id)["state"]
+                queries = latest_state.get("search_queries", [])
+                current_index = int(latest_state.get("query_index", 0))
+                failed_query = queries[current_index] if current_index < len(queries) else query
+                failed_queries = list(latest_state.get("provider_failure_queries", []))
+                if failed_query not in failed_queries:
+                    failed_queries.append(failed_query)
+                pending_indices = [index for index, item in enumerate(queries)
+                                   if not latest_state.get("query_states", {}).get(item, {}).get("exhausted")]
+                untried_indices = [index for index in pending_indices if queries[index] not in failed_queries]
+                if untried_indices and len(failed_queries) < min(3, max(1, len(pending_indices))) and retry_after is None:
+                    next_query_index = next((index for index in untried_indices if index > current_index), untried_indices[0])
+                    provider_failure_queries = failed_queries
+                    delay = min(delay, 0.25)
+                else:
+                    remaining = [index for index in pending_indices if index > current_index]
+                    next_query_index = (remaining or pending_indices or [current_index])[0]
+                    provider_failure_queries = []
+                    delay = max(delay, float(self.search_retry_seconds))
+            self.store.set_search_retry(job_id, time.time() + delay, str(exc),
+                http_status=getattr(exc, "http_status", None), diagnostics=error_diagnostics,
+                failed_query=failed_query, next_query_index=next_query_index,
+                provider_failure_queries=provider_failure_queries)
             event = self.decision_events.setdefault(job_id, asyncio.Event())
             event.clear()
             current = self.store.get(job_id)
@@ -433,13 +481,44 @@ class JobManager:
             return
         state = record["state"]
         state["status"] = state["current_stage"] = status
+        state["completion_reason"] = reason
         state["pending_decision_id"] = None
         if status == "completed" and reason == "search_exhausted":
             state.setdefault("warnings", []).append({"message": "All configured search queries were exhausted and the URL queue is empty."})
         self.store.save(job_id, state, status=status, event=("job_" + status, {
             "job_id": job_id, "status": status, "reason": reason,
             "successful_results": len(state["results"]), "processed_page_count": state["processed_page_count"],
+            "search_diagnostics": self._search_diagnostics(state),
         }))
+
+    @staticmethod
+    def _search_diagnostics(state: dict) -> dict:
+        queries = state.get("query_states", {})
+        totals = {key: 0 for key in ("pages", "raw_results", "valid_urls", "new_urls", "duplicate_urls", "rejected_urls")}
+        for query_state in queries.values():
+            for key, value in query_state.get("totals", {}).items():
+                if key in totals:
+                    totals[key] += int(value or 0)
+        query_list = state.get("search_queries", [])
+        index = min(int(state.get("query_index", 0)), max(0, len(query_list) - 1))
+        consumed = sum(
+            1 for item in queries.values()
+            if item.get("status") == "exhausted" or int(item.get("totals", {}).get("pages", 0) or 0) > 0
+        )
+        return {
+            "query_count": len(query_list),
+            "queries_attempted": len(queries),
+            "queries_consumed": consumed,
+            "queries_exhausted": sum(item.get("status") == "exhausted" for item in queries.values()),
+            "current_query_index": state.get("query_index", 0),
+            "current_query": query_list[index] if query_list else "",
+            "search_batch_size": state.get("search_batch_size"),
+            "queue_url_count": len(state.get("url_queue", [])),
+            "seen_url_count": len(state.get("seen_urls", [])),
+            "search_retry_at": state.get("search_retry_at"),
+            "search_exhausted": bool(state.get("search_exhausted")),
+            **totals,
+        }
 
     def decide(self, job_id: str, decision_id: str, decision: bool) -> dict:
         result = self.store.resolve_decision(job_id, decision_id, decision)
@@ -547,7 +626,7 @@ class JobManager:
             self.store.save(job_id, state, event=("search_completed", self._summary(state)))
             return
 
-        async def page_checkpoint(next_page: int, new_pages: list[dict], exhausted: bool) -> None:
+        async def page_checkpoint(next_page: int, new_pages: list[dict], exhausted: bool, diagnostics: dict | None = None) -> None:
             current = self.store.get(job_id)["state"]
             current_pages = current["round_pages"]
             seen = {page["url"] for page in current_pages}

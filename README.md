@@ -74,9 +74,13 @@ Each result record has exactly `number`, `source_url`, `website_url`, `page_titl
 
 ## Search, retries, and recovery
 
-The search strategy creates a set of distinct keyword/location/contact queries and stores an independent next-page cursor and exhaustion state for each query. An empty page exhausts only that query. Search continues into other queries until a full URL batch is ready or the entire strategy is exhausted. The old fixed three-round workflow is not used for new jobs.
+The search strategy keeps Persian location/topic queries and expands common topics into related terms. It tries each Persian query with `site:.ir` and also has a localized fallback without the operator. Candidate validation accepts `.ir` domains; a different top-level domain is accepted only if SearXNG's title/snippet contains the requested location in Persian. This keeps relevant local `.com` businesses discoverable while rejecting unrelated international results. SearXNG's `language` parameter is an engine preference; `en-US` does not translate the query or mean that English businesses are requested. Live validation returned Iranian `.ir` sites for the Persian query `موبایل اصفهان site:.ir`.
 
-`MAX_SEARCH_PAGES` defaults to `0`, meaning no page-count limit. If SearXNG fails, the cursor is retained and retry is scheduled after `SEARCH_RETRY_SECONDS` (default 60), or after a valid SearXNG `Retry-After` value. A failed URL is reported to the consumer and does not terminate the job.
+Search keeps an independent next-page cursor and exhaustion state for each query. An empty response exhausts only that query. A page with no results while SearXNG reports unresponsive engines is treated as a provider failure; the cursor is retained and the worker tries other local queries before pausing for retry. It does not exhaust that query. Consecutive identical result pages are detected to prevent pagination loops. Search continues into other queries until a full URL batch is ready or every query has truly exhausted. SearXNG reported DuckDuckGo CAPTCHA responses and Google CSE rate suspension during live checks, so these conditions must not be confused with a genuine empty search.
+
+Search requests default to `SEARXNG_LANGUAGE=en-US`. In live checks, `fa-IR` and `all` returned zero results for the tested queries while some `en-US` requests also returned zero when engines were unavailable. The Persian query with the explicit `site:.ir` constraint returned ten Iranian-domain results with `en-US`. The parameter alone does not guarantee results; the query restriction and healthy search engines matter too.
+
+`MAX_SEARCH_PAGES` defaults to `0`, meaning no hard page-count limit. If SearXNG fails, the cursor is retained and retry is scheduled after `SEARCH_RETRY_SECONDS` (default 60), or after a valid SearXNG `Retry-After` value. Authenticated job status and final results include aggregate `search_diagnostics` and per-query `query_diagnostics`: page/raw-result/valid/new/duplicate/rejected totals, cursor, retry state, last HTTP status, rejection reasons, and last-page metrics. These diagnostics contain no phone values.
 
 Internal job model version 4 stores the queue, seen URLs, batch, query cursors, page states, pending decision, decision history, and results in SQLite. On restart, a job awaiting approval keeps the same decision ID. An interrupted crawl URL is returned to pending and safely retried; result rows and their URL events are committed in the same transaction. Existing version 3 jobs keep their prior runner and event history.
 
@@ -86,6 +90,8 @@ Relevant `.env` settings:
 
 - `SEARCH_BATCH_SIZE=1000`
 - `SEARCH_RETRY_SECONDS=60`
+- `SEARXNG_LANGUAGE=en-US`
+- Search candidate policy: `.ir`, or non-`.ir` only when Persian indexed text names the requested location
 - `MAX_SEARCH_PAGES=0` (zero means unlimited pagination)
 - `SEARXNG_URL`, `SEARCH_TIMEOUT`
 - `FIRECRAWL_URL`, `CRAWL_TIMEOUT`, `MAX_CRAWL_PAGES`, `MAX_CRAWL_DEPTH`
@@ -93,6 +99,10 @@ Relevant `.env` settings:
 - `JOB_DB_PATH`, `JOB_TTL_SECONDS`, `JOB_CLEANUP_INTERVAL`
 
 The application supplies defaults; no `.env` edit is required unless you want to change batch size or retry delay.
+
+## Info Extractor connection
+
+See [Info Extractor integration](doc/INFO_EXTRACTOR_INTEGRATION.md) for the remote service configuration, request/decision flow, and diagnostics to inspect when a web search ends without candidate URLs.
 
 ## Tests
 
