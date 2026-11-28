@@ -70,10 +70,79 @@ class JobStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_expiry ON jobs(status, expires_at);
                 CREATE INDEX IF NOT EXISTS idx_events_job_id ON job_events(job_id, event_id);
+                CREATE TABLE IF NOT EXISTS job_batches (
+                    job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+                    batch_number INTEGER NOT NULL,
+                    batch_size INTEGER NOT NULL,
+                    phase TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    search_started_at REAL,
+                    search_completed_at REAL,
+                    crawl_started_at REAL,
+                    completed_at REAL,
+                    urls_collected INTEGER NOT NULL DEFAULT 0,
+                    urls_processed INTEGER NOT NULL DEFAULT 0,
+                    urls_failed INTEGER NOT NULL DEFAULT 0,
+                    current_position INTEGER NOT NULL DEFAULT 0,
+                    retry_at REAL,
+                    last_error TEXT,
+                    last_checkpoint_at REAL NOT NULL,
+                    PRIMARY KEY(job_id, batch_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_batches_status ON job_batches(job_id, status, batch_number);
+                CREATE TABLE IF NOT EXISTS job_urls (
+                    job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+                    url TEXT NOT NULL,
+                    website_url TEXT NOT NULL,
+                    search_title TEXT NOT NULL DEFAULT '',
+                    batch_number INTEGER,
+                    position INTEGER,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    retry_at REAL,
+                    discovered_at REAL NOT NULL,
+                    started_at REAL,
+                    completed_at REAL,
+                    firecrawl_job_id TEXT,
+                    firecrawl_next_url TEXT,
+                    firecrawl_page_offset INTEGER NOT NULL DEFAULT 0,
+                    pages_processed INTEGER NOT NULL DEFAULT 0,
+                    results_extracted INTEGER NOT NULL DEFAULT 0,
+                    compat_decision_id TEXT,
+                    PRIMARY KEY(job_id, url),
+                    UNIQUE(job_id, batch_number, position)
+                );
+                CREATE INDEX IF NOT EXISTS idx_job_urls_batch ON job_urls(job_id, batch_number, position, status);
+                CREATE INDEX IF NOT EXISTS idx_job_urls_queue ON job_urls(job_id, status, discovered_at);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_job_urls_decision ON job_urls(job_id, compat_decision_id) WHERE compat_decision_id IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS job_results (
+                    job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+                    number TEXT NOT NULL,
+                    candidate_url TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    website_url TEXT NOT NULL,
+                    page_title TEXT NOT NULL DEFAULT '',
+                    page_description TEXT NOT NULL DEFAULT '',
+                    batch_number INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(job_id, number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_job_results_url ON job_results(job_id, candidate_url, created_at);
+                CREATE TABLE IF NOT EXISTS job_compat_decisions (
+                    job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+                    decision_id TEXT NOT NULL,
+                    candidate_url TEXT,
+                    decision_value INTEGER,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(job_id, decision_id)
+                );
                 """
             )
             self._migrate_legacy_jobs(connection)
             self._migrate_job_model(connection)
+            self._migrate_auto_jobs(connection)
+            connection.execute("PRAGMA user_version=5")
         os.chmod(self.path, 0o600)
 
     def _migrate_legacy_jobs(self, connection: sqlite3.Connection) -> None:
@@ -251,6 +320,167 @@ class JobStore:
             connection.rollback()
             raise
 
+    def _migrate_auto_jobs(self, connection: sqlite3.Connection) -> None:
+        """Move v4 approval jobs into normalized v5 batch/URL/result tables atomically."""
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = connection.execute("SELECT job_id,status,state_json,updated_at FROM jobs").fetchall()
+            now = time.time()
+            for row in rows:
+                job_id = str(row["job_id"])
+                state = json.loads(row["state_json"])
+                version = int(state.get("job_model_version", 3))
+                if version != 4:
+                    continue
+
+                batch_urls = list(state.get("batch_urls", []))
+                page_statuses = state.get("page_statuses", {}) if isinstance(state.get("page_statuses"), dict) else {}
+                batch_number = max(0, int(state.get("batch_number", 0)))
+                batch_size = max(1, int(state.get("search_batch_size", 100)))
+                batch_index = max(0, int(state.get("batch_index", 0)))
+                old_stage = str(state.get("current_stage", "searching"))
+                pending_id = state.get("pending_decision_id")
+                if old_stage == "awaiting_approval" and batch_index < len(batch_urls):
+                    completed_candidate = batch_urls[batch_index]
+                    completed_url = str(completed_candidate.get("url", ""))
+                    info = page_statuses.setdefault(completed_url, {})
+                    info["status"] = "completed"
+                    batch_index += 1
+
+                assigned = batch_urls[batch_index:] if batch_urls else []
+                current_batch_number = batch_number if assigned else 0
+                batch_status = "crawling" if assigned else "completed"
+                if old_stage == "awaiting_approval" and not assigned:
+                    old_stage = "searching"
+
+                current_queue = list(state.get("url_queue", []))
+                if batch_urls:
+                    current_queue = current_queue[len(batch_urls):]
+                candidates: dict[str, dict] = {}
+                if pending_id and batch_index > 0 and batch_index - 1 < len(batch_urls):
+                    completed_candidate = batch_urls[batch_index - 1]
+                    if isinstance(completed_candidate, dict) and completed_candidate.get("url"):
+                        candidates[str(completed_candidate["url"])] = {
+                            **completed_candidate, "batch_number": batch_number or None, "position": batch_index,
+                        }
+                for index, candidate in enumerate(batch_urls[batch_index:], start=batch_index + 1):
+                    if isinstance(candidate, dict) and candidate.get("url"):
+                        candidates[str(candidate["url"])] = {**candidate, "batch_number": current_batch_number, "position": index}
+                for candidate in current_queue:
+                    if isinstance(candidate, dict) and candidate.get("url"):
+                        candidates.setdefault(str(candidate["url"]), {**candidate, "batch_number": None, "position": None})
+                for url in state.get("seen_urls", []):
+                    if isinstance(url, str) and url:
+                        candidates.setdefault(url, {"url": url, "website_url": "", "batch_number": None, "position": None})
+
+                active_batch_no = current_batch_number or (batch_number + 1 if row["status"] not in TERMINAL else 0)
+                for url, candidate in candidates.items():
+                    info = page_statuses.get(url, {})
+                    status = str(info.get("status", "pending"))
+                    if status == "processing":
+                        status = "pending"
+                    if status == "pending":
+                        status = "queued"
+                    connection.execute(
+                        """INSERT OR IGNORE INTO job_urls(
+                            job_id,url,website_url,search_title,batch_number,position,status,attempt_count,last_error,
+                            discovered_at,started_at,completed_at,firecrawl_job_id,firecrawl_next_url,firecrawl_page_offset,
+                            pages_processed,results_extracted
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (job_id, url, candidate.get("website_url") or "", str(candidate.get("search_title", "")),
+                         candidate.get("batch_number"), candidate.get("position"), status,
+                         int(info.get("attempt_count", 1 if info.get("status") in {"completed", "failed"} else 0)),
+                         info.get("error"), now, info.get("started_at"), info.get("completed_at"),
+                         info.get("firecrawl_job_id"), info.get("firecrawl_next_url"), int(info.get("firecrawl_page_offset", 0)),
+                         int(info.get("pages_processed", 0)), int(info.get("new_results_count", 0))),
+                    )
+
+                if active_batch_no:
+                    batch_count = len(assigned)
+                    batch_processed = sum(1 for item in assigned if page_statuses.get(item.get("url"), {}).get("status") in {"completed", "failed"})
+                    batch_failed = sum(1 for item in assigned if page_statuses.get(item.get("url"), {}).get("status") == "failed")
+                    connection.execute(
+                        """INSERT OR IGNORE INTO job_batches(
+                            job_id,batch_number,batch_size,phase,status,search_started_at,search_completed_at,
+                            crawl_started_at,completed_at,urls_collected,urls_processed,urls_failed,current_position,
+                            last_checkpoint_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (job_id, active_batch_no, batch_size, "crawl" if assigned else "search", batch_status,
+                         row["updated_at"], row["updated_at"] if assigned else None,
+                         row["updated_at"] if assigned else None, row["updated_at"] if not assigned and row["status"] in TERMINAL else None,
+                         batch_count, batch_processed, batch_failed, batch_processed, now),
+                    )
+
+                for decision_id, decision_value in (state.get("decisions", {}) or {}).items():
+                    connection.execute(
+                        "INSERT OR IGNORE INTO job_compat_decisions(job_id,decision_id,decision_value,created_at) VALUES(?,?,?,?)",
+                        (job_id, str(decision_id), int(bool(decision_value)), now),
+                    )
+                if pending_id:
+                    pending_url = None
+                    if batch_index > 0 and batch_index - 1 < len(batch_urls):
+                        pending_url = batch_urls[batch_index - 1].get("url")
+                    connection.execute(
+                        "INSERT OR IGNORE INTO job_compat_decisions(job_id,decision_id,candidate_url,created_at) VALUES(?,?,?,?)",
+                        (job_id, str(pending_id), pending_url, now),
+                    )
+                    if pending_url:
+                        connection.execute("UPDATE job_urls SET compat_decision_id=? WHERE job_id=? AND url=?",
+                                           (str(pending_id), job_id, str(pending_url)))
+
+                for record in state.get("results", []):
+                    if not isinstance(record, dict) or not re.fullmatch(r"09\d{9}", str(record.get("number", ""))):
+                        continue
+                    source_url = str(record.get("source_url", ""))
+                    candidate_url = source_url if source_url in candidates else next(iter(candidates), source_url)
+                    connection.execute(
+                        """INSERT OR IGNORE INTO job_results(
+                            job_id,number,candidate_url,source_url,website_url,page_title,page_description,batch_number,created_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                        (job_id, str(record["number"]), candidate_url, source_url, str(record.get("website_url", "")),
+                         str(record.get("page_title", "")), str(record.get("page_description", "")),
+                         int(candidates.get(candidate_url, {}).get("batch_number") or max(1, batch_number)), now),
+                    )
+
+                is_running = row["status"] not in TERMINAL
+                if is_running:
+                    next_stage = "crawling" if assigned else "searching"
+                    if old_stage == "paused_memory":
+                        next_stage = "paused_memory"
+                    state.update({
+                        "schema_version": 3, "job_model_version": 5, "mode": "automatic",
+                        "current_stage": next_stage, "current_phase": "crawl" if assigned else "search",
+                        "batch_number": active_batch_no or max(0, batch_number), "batch_size": batch_size,
+                        "search_exhausted": bool(state.get("search_exhausted", False)),
+                        "stop_requested": bool(state.get("stop_requested", False)),
+                        "result_count": len(state.get("results", [])), "last_checkpoint_at": now,
+                        "memory_pause": state.get("memory_pause"),
+                    })
+                    state.pop("pending_decision_id", None)
+                    state.pop("batch_urls", None)
+                    state.pop("url_queue", None)
+                    state.pop("seen_urls", None)
+                    state.pop("page_statuses", None)
+                    state.pop("active_urls", None)
+                    state.pop("active_url", None)
+                    state.pop("registered_numbers", None)
+                    state.pop("results", None)
+                    state.pop("decisions", None)
+                    state.pop("provider_failure_queries", None)
+                    connection.execute("UPDATE jobs SET state_json=?,updated_at=? WHERE job_id=?", (self._json(state), now, job_id))
+                else:
+                    state.update({"schema_version": 3, "job_model_version": 5, "mode": "automatic",
+                                  "result_count": len(state.get("results", [])), "batch_size": batch_size,
+                                  "last_checkpoint_at": now})
+                    state.pop("results", None)
+                    state.pop("registered_numbers", None)
+                    state.pop("decisions", None)
+                    connection.execute("UPDATE jobs SET state_json=? WHERE job_id=?", (self._json(state), job_id))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
     @staticmethod
     def _json(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -322,16 +552,24 @@ class JobStore:
                 connection.commit()
                 return False
             state["status"] = "running"
+            resumed_stage = state.get("resume_stage")
             if int(state.get("job_model_version", 3)) < 4:
                 state["current_stage"] = "preparing"
             elif state.get("current_stage") in {"queued", "preparing"}:
                 state["current_stage"] = "searching"
+            else:
+                state.pop("resume_stage", None)
             now = time.time()
             connection.execute(
                 "UPDATE jobs SET status='running',state_json=?,updated_at=? WHERE job_id=?",
                 (self._json(state), now, job_id),
             )
             self._append_event(connection, job_id, "progress", {"status": "running", "current_stage": state["current_stage"]})
+            if resumed_stage:
+                self._append_event(connection, job_id, "job_resumed", {
+                    "status": "running", "current_stage": state["current_stage"],
+                    "resume_stage": resumed_stage, "reason": "checkpoint_recovery",
+                })
             connection.commit()
             return True
         except Exception:
@@ -792,6 +1030,716 @@ class JobStore:
                 self._append_event(connection, job_id, "job_stopped", {"job_id": job_id, "status": "stopped", "reason": "stop_requested"})
             connection.commit()
             return state
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def auto_snapshot(self, job_id: str, *, include_results: bool = True) -> dict | None:
+        """Read normalized v5 progress without rehydrating URL/result arrays into stored state."""
+        with self._db() as connection:
+            row = connection.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                return None
+            state = json.loads(row["state_json"])
+            batch_no = int(state.get("batch_number", 0) or 0)
+            batch = connection.execute(
+                "SELECT * FROM job_batches WHERE job_id=? AND batch_number=?", (job_id, batch_no)
+            ).fetchone() if batch_no else None
+            url_rows = connection.execute(
+                "SELECT * FROM job_urls WHERE job_id=? AND batch_number=? ORDER BY position",
+                (job_id, batch_no),
+            ).fetchall() if batch_no else []
+            queued = connection.execute(
+                "SELECT COUNT(*) FROM job_urls WHERE job_id=? AND batch_number IS NULL AND status='queued'", (job_id,)
+            ).fetchone()[0]
+            active = connection.execute(
+                "SELECT * FROM job_urls WHERE job_id=? AND status='processing' ORDER BY started_at LIMIT 1", (job_id,)
+            ).fetchone()
+            total_urls = connection.execute("SELECT COUNT(*) FROM job_urls WHERE job_id=?", (job_id,)).fetchone()[0]
+            completed_urls = connection.execute(
+                "SELECT COUNT(*) FROM job_urls WHERE job_id=? AND status='completed'", (job_id,)
+            ).fetchone()[0]
+            failed_urls = connection.execute(
+                "SELECT COUNT(*) FROM job_urls WHERE job_id=? AND status='failed'", (job_id,)
+            ).fetchone()[0]
+            result_count = int(connection.execute("SELECT COUNT(*) FROM job_results WHERE job_id=?", (job_id,)).fetchone()[0])
+            results = [dict(item) for item in connection.execute(
+                "SELECT number,source_url,website_url,page_title,page_description FROM job_results WHERE job_id=? ORDER BY created_at,number",
+                (job_id,),
+            ).fetchall()] if include_results else []
+        current_urls = [dict(item) for item in url_rows]
+        batch_data = dict(batch) if batch is not None else None
+        query_list = state.get("search_queries", [])
+        idx = int(state.get("query_index", 0))
+        return {
+            "job_id": row["job_id"], "status": row["status"], "state": state,
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+            "last_event_id": row["last_event_id"], "batch": batch_data,
+            "batch_urls": current_urls, "queued_url_count": int(queued),
+            "total_url_count": int(total_urls), "completed_url_count": int(completed_urls),
+            "failed_url_count": int(failed_urls), "results": results,
+            "result_count": result_count,
+            "current_query": query_list[idx] if 0 <= idx < len(query_list) else None,
+            "current_url": dict(active) if active else None,
+        }
+
+    def auto_url_exists(self, job_id: str, url: str) -> bool:
+        with self._db() as connection:
+            return connection.execute("SELECT 1 FROM job_urls WHERE job_id=? AND url=?", (job_id, url)).fetchone() is not None
+
+    def auto_active_batch(self, job_id: str) -> dict | None:
+        with self._db() as connection:
+            row = connection.execute(
+                "SELECT b.* FROM job_batches b JOIN jobs j ON j.job_id=b.job_id "
+                "WHERE b.job_id=? AND b.batch_number=json_extract(j.state_json,'$.batch_number') "
+                "AND b.status IN ('collecting','ready','crawling')",
+                (job_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def auto_search_complete(self, job_id: str) -> bool:
+        with self._db() as connection:
+            row = connection.execute("SELECT state_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            return bool(row and json.loads(row["state_json"]).get("search_exhausted"))
+
+    def auto_has_pending_urls(self, job_id: str) -> bool:
+        with self._db() as connection:
+            return connection.execute("SELECT 1 FROM job_urls WHERE job_id=? AND batch_number IS NULL AND status='queued' LIMIT 1", (job_id,)).fetchone() is not None
+
+    def auto_seal_batch(self, job_id: str) -> None:
+        """Promote a partial collecting batch when search has exhausted its configured queries."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT state_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            state = json.loads(row["state_json"])
+            batch_no = int(state.get("batch_number", 0))
+            batch = connection.execute("SELECT * FROM job_batches WHERE job_id=? AND batch_number=?", (job_id, batch_no)).fetchone()
+            if batch and batch["status"] == "collecting" and state.get("search_exhausted"):
+                count = int(connection.execute("SELECT COUNT(*) FROM job_urls WHERE job_id=? AND batch_number=?", (job_id, batch_no)).fetchone()[0])
+                now = time.time()
+                if count:
+                    connection.execute("UPDATE job_batches SET status='ready',phase='crawl',search_completed_at=?,urls_collected=?,last_checkpoint_at=? WHERE job_id=? AND batch_number=?", (now, count, now, job_id, batch_no))
+                    state.update({"current_stage": "batch_ready", "current_phase": "crawl"})
+                    self._append_event(connection, job_id, "batch_ready", {"batch_number": batch_no, "url_count": count, "search_exhausted": True})
+                else:
+                    state.update({"current_stage": "completed", "completion_reason": "search_exhausted"})
+                    connection.execute("UPDATE jobs SET status='completed' WHERE job_id=?", (job_id,))
+                state["last_checkpoint_at"] = now
+                connection.execute("UPDATE jobs SET state_json=?,updated_at=? WHERE job_id=?", (self._json(state), now, job_id))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def auto_mark_search_exhausted(self, job_id: str) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT state_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            state = json.loads(row["state_json"])
+            state["search_exhausted"] = True
+            state["query_index"] = len(state.get("search_queries", []))
+            state["last_checkpoint_at"] = time.time()
+            connection.execute("UPDATE jobs SET state_json=?,updated_at=? WHERE job_id=?", (self._json(state), time.time(), job_id))
+            self._append_event(connection, job_id, "search_exhausted", self._auto_search_summary(state))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def auto_begin_batch(self, job_id: str) -> dict | None:
+        """Create the next durable batch and move any preserved overflow URLs into it."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT status,state_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            state = json.loads(row["state_json"])
+            if row["status"] in TERMINAL or state.get("stop_requested"):
+                connection.commit()
+                return None
+            active = connection.execute(
+                "SELECT * FROM job_batches WHERE job_id=? AND status IN ('collecting','ready','crawling') ORDER BY batch_number DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
+            if active:
+                connection.commit()
+                return dict(active)
+            next_number = int(connection.execute(
+                "SELECT COALESCE(MAX(batch_number),0)+1 FROM job_batches WHERE job_id=?", (job_id,)
+            ).fetchone()[0])
+            batch_size = max(1, int(state.get("search_batch_size", 100)))
+            now = time.time()
+            candidates = connection.execute(
+                "SELECT url FROM job_urls WHERE job_id=? AND batch_number IS NULL AND status='queued' ORDER BY discovered_at,url LIMIT ?",
+                (job_id, batch_size),
+            ).fetchall()
+            for position, candidate in enumerate(candidates, start=1):
+                connection.execute(
+                    "UPDATE job_urls SET batch_number=?,position=? WHERE job_id=? AND url=? AND batch_number IS NULL",
+                    (next_number, position, job_id, candidate["url"]),
+                )
+            count = len(candidates)
+            exhausted = bool(state.get("search_exhausted"))
+            ready = count >= batch_size or exhausted
+            status = "ready" if ready and count else "collecting"
+            phase = "crawl" if status == "ready" else "search"
+            state.update({"batch_number": next_number, "current_stage": "batch_ready" if status == "ready" else "searching",
+                          "current_phase": phase, "last_checkpoint_at": now})
+            connection.execute(
+                "INSERT INTO job_batches(job_id,batch_number,batch_size,phase,status,search_started_at,search_completed_at,urls_collected,last_checkpoint_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (job_id, next_number, batch_size, phase, status, now, now if ready else None, count, now),
+            )
+            connection.execute(
+                "UPDATE jobs SET state_json=?,updated_at=? WHERE job_id=?", (self._json(state), now, job_id)
+            )
+            self._append_event(connection, job_id, "batch_started", {
+                "batch_number": next_number, "batch_size": batch_size, "urls_already_queued": count,
+                "phase": phase,
+            })
+            if status == "ready":
+                self._append_event(connection, job_id, "batch_ready", {
+                    "batch_number": next_number, "url_count": count, "search_exhausted": exhausted,
+                })
+            connection.commit()
+            return dict(connection.execute(
+                "SELECT * FROM job_batches WHERE job_id=? AND batch_number=?", (job_id, next_number)
+            ).fetchone())
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def auto_record_search_page(self, job_id: str, query: str, next_page: int, candidates: list[dict],
+                                exhausted: bool, diagnostics: dict | None = None) -> dict:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT state_json,status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            state = json.loads(row["state_json"])
+            if state.get("stop_requested") or row["status"] in TERMINAL:
+                connection.commit()
+                return {"stopped": True, "batch_ready": False, "search_exhausted": state.get("search_exhausted", False)}
+            batch_no = int(state.get("batch_number", 0))
+            batch = connection.execute(
+                "SELECT * FROM job_batches WHERE job_id=? AND batch_number=? AND status='collecting'", (job_id, batch_no)
+            ).fetchone()
+            if batch is None:
+                raise RuntimeError("Search page arrived without an active collecting batch")
+            size = int(batch["batch_size"])
+            current = int(connection.execute(
+                "SELECT COUNT(*) FROM job_urls WHERE job_id=? AND batch_number=?", (job_id, batch_no)
+            ).fetchone()[0])
+            added = 0
+            queued_extra = 0
+            for candidate in candidates:
+                url = str(candidate.get("url") or "")
+                if not url:
+                    continue
+                existing = connection.execute("SELECT 1 FROM job_urls WHERE job_id=? AND url=?", (job_id, url)).fetchone()
+                if existing:
+                    continue
+                assigned = current < size
+                position = current + 1 if assigned else None
+                connection.execute(
+                    """INSERT INTO job_urls(job_id,url,website_url,search_title,batch_number,position,status,discovered_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (job_id, url, str(candidate.get("website_url") or ""), str(candidate.get("search_title") or ""),
+                     batch_no if assigned else None, position, "queued", time.time()),
+                )
+                if assigned:
+                    current += 1
+                    added += 1
+                else:
+                    queued_extra += 1
+            query_state = state.setdefault("query_states", {}).setdefault(query, {"next_page": 1, "exhausted": False})
+            page_data = dict(diagnostics or {})
+            page_data.update({"next_page": int(next_page), "new_url_count": added, "queued_extra_count": queued_extra})
+            query_state.update({"next_page": int(next_page), "exhausted": bool(exhausted),
+                                "status": "exhausted" if exhausted else "active", "last_error": None})
+            if page_data.get("result_fingerprint"):
+                query_state["last_fingerprint"] = page_data["result_fingerprint"]
+            recent = query_state.setdefault("recent_pages", [])
+            recent.append(page_data)
+            query_state["recent_pages"] = recent[-20:]
+            totals = query_state.setdefault("totals", {"pages": 0, "raw_results": 0, "valid_urls": 0, "new_urls": 0,
+                "duplicate_urls": 0, "rejected_urls": 0})
+            totals["pages"] += 1
+            for target, source in (("raw_results", "raw_result_count"), ("valid_urls", "valid_url_count"),
+                                   ("new_urls", "new_url_count"), ("duplicate_urls", "duplicate_url_count"),
+                                   ("rejected_urls", "rejected_url_count")):
+                totals[target] += int(page_data.get(source, 0) or 0)
+            queries = state.get("search_queries", [])
+            if exhausted and query in queries:
+                pending = [i for i, item in enumerate(queries) if not state["query_states"].get(item, {}).get("exhausted")]
+                after = [i for i in pending if i > queries.index(query)]
+                state["query_index"] = (after or pending or [len(queries)])[0]
+            state["search_exhausted"] = bool(queries) and all(
+                state["query_states"].get(item, {}).get("exhausted", False) for item in queries
+            )
+            now = time.time()
+            count = current
+            ready = count >= size or state["search_exhausted"]
+            connection.execute(
+                "UPDATE job_batches SET urls_collected=?,last_checkpoint_at=?,search_completed_at=CASE WHEN ? THEN ? ELSE search_completed_at END,phase=CASE WHEN ? THEN 'crawl' ELSE phase END,status=CASE WHEN ? THEN 'ready' ELSE status END WHERE job_id=? AND batch_number=?",
+                (count, now, int(ready), now, int(ready), int(ready and count > 0), job_id, batch_no),
+            )
+            if ready and count == 0:
+                state["current_stage"] = "completed"
+                state["completion_reason"] = "search_exhausted"
+                connection.execute("UPDATE jobs SET status='completed' WHERE job_id=?", (job_id,))
+                self._append_event(connection, job_id, "job_completed", {
+                    "job_id": job_id, "status": "completed", "reason": "search_exhausted",
+                    "search_diagnostics": self._auto_search_summary(state),
+                })
+            else:
+                state["current_stage"] = "batch_ready" if ready else "searching"
+                state["current_phase"] = "crawl" if ready else "search"
+            state["last_search_error"] = None
+            state["search_retry_at"] = None
+            state["provider_failure_queries"] = []
+            state["last_checkpoint_at"] = now
+            connection.execute("UPDATE jobs SET state_json=?,updated_at=? WHERE job_id=?", (self._json(state), now, job_id))
+            self._append_event(connection, job_id, "search_progress", {
+                "batch_number": batch_no, "query": query, "query_index": state.get("query_index"),
+                "search_page_consumed": int(next_page) - 1, "urls_collected": count,
+                "queued_extra_count": queued_extra, "diagnostics": page_data,
+            })
+            if ready and count:
+                self._append_event(connection, job_id, "batch_ready", {
+                    "batch_number": batch_no, "url_count": count, "search_exhausted": state["search_exhausted"],
+                })
+            connection.commit()
+            return {"stopped": False, "batch_ready": ready, "search_exhausted": state["search_exhausted"], "urls_collected": count}
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _auto_search_summary(state: dict) -> dict:
+        query_states = state.get("query_states", {})
+        totals = {key: 0 for key in ("pages", "raw_results", "valid_urls", "new_urls", "duplicate_urls", "rejected_urls")}
+        for item in query_states.values():
+            for key in totals:
+                totals[key] += int(item.get("totals", {}).get(key, 0) or 0)
+        return {"query_count": len(state.get("search_queries", [])),
+                "queries_attempted": len(query_states),
+                "queries_consumed": sum(bool(item.get("exhausted")) for item in query_states.values()),
+                "queries_exhausted": sum(bool(item.get("exhausted")) for item in query_states.values()),
+                "current_query_index": int(state.get("query_index", 0)),
+                "search_exhausted": bool(state.get("search_exhausted")), **totals}
+
+    def auto_search_retry(self, job_id: str, query: str, error: str, retry_at: float,
+                          http_status: int | None, diagnostics: dict | None,
+                          next_query_index: int | None = None, failure_cycle: list[str] | None = None) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT state_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            state = json.loads(row["state_json"])
+            now = time.time()
+            state["search_retry_at"] = retry_at
+            state["last_search_error"] = error[:500]
+            state["last_checkpoint_at"] = now
+            if next_query_index is not None:
+                state["query_index"] = int(next_query_index)
+            if failure_cycle is not None:
+                state["provider_failure_queries"] = failure_cycle
+            query_state = state.setdefault("query_states", {}).setdefault(query, {"next_page": 1, "exhausted": False})
+            query_state.update({"status": "retry_wait", "retry_at": retry_at, "last_error": error[:500],
+                                "last_http_status": http_status, "last_error_diagnostics": diagnostics or {}})
+            connection.execute("UPDATE jobs SET state_json=?,updated_at=? WHERE job_id=?", (self._json(state), now, job_id))
+            self._append_event(connection, job_id, "warning", {"stage": "searching", "query_index": state.get("query_index"),
+                "message": error[:500], "retry_at": retry_at, "http_status": http_status,
+                "diagnostics": diagnostics or {}})
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def auto_start_url(self, job_id: str) -> dict | None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT status,state_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            state = json.loads(row["state_json"])
+            if row["status"] in TERMINAL or state.get("stop_requested"):
+                connection.commit()
+                return None
+            batch_no = int(state.get("batch_number", 0))
+            batch = connection.execute("SELECT * FROM job_batches WHERE job_id=? AND batch_number=?", (job_id, batch_no)).fetchone()
+            if not batch or batch["status"] not in {"ready", "crawling"}:
+                connection.commit()
+                return None
+            url_row = connection.execute(
+                "SELECT * FROM job_urls WHERE job_id=? AND batch_number=? AND status IN ('queued','pending','processing') "
+                "AND (retry_at IS NULL OR retry_at<=?) ORDER BY position LIMIT 1",
+                (job_id, batch_no, time.time()),
+            ).fetchone()
+            if url_row is None:
+                connection.commit()
+                return None
+            resumed = url_row["status"] == "processing" or bool(url_row["firecrawl_job_id"])
+            now = time.time()
+            connection.execute(
+                "UPDATE job_urls SET status='processing',attempt_count=attempt_count+1,started_at=COALESCE(started_at,?) WHERE job_id=? AND url=?",
+                (now, job_id, url_row["url"]),
+            )
+            connection.execute(
+                "UPDATE job_batches SET status='crawling',phase='crawl',crawl_started_at=COALESCE(crawl_started_at,?),current_position=?,last_checkpoint_at=? WHERE job_id=? AND batch_number=?",
+                (now, url_row["position"], now, job_id, batch_no),
+            )
+            state.update({"current_stage": "crawling", "current_phase": "crawl", "current_url": url_row["url"],
+                          "last_checkpoint_at": now})
+            connection.execute("UPDATE jobs SET state_json=?,updated_at=? WHERE job_id=?", (self._json(state), now, job_id))
+            self._append_event(connection, job_id, "crawl_started", {
+                "batch_number": batch_no, "position": url_row["position"], "candidate_url": url_row["url"], "resumed": resumed,
+            })
+            connection.commit()
+            value = dict(url_row)
+            value["attempt_count"] = int(url_row["attempt_count"]) + 1
+            value["status"] = "processing"
+            return value
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def auto_set_firecrawl_job(self, job_id: str, url: str, remote_id: str | None) -> None:
+        with self._db() as connection:
+            now = time.time()
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE job_urls SET firecrawl_job_id=?,firecrawl_next_url=NULL,firecrawl_page_offset=0,last_error=NULL WHERE job_id=? AND url=?",
+                (remote_id, job_id, url),
+            )
+            connection.execute("UPDATE jobs SET updated_at=? WHERE job_id=?", (now, job_id))
+            connection.execute("COMMIT")
+
+    def auto_set_firecrawl_cursor(self, job_id: str, url: str, next_url: str | None, page_offset: int,
+                                  page_completed: bool = False) -> None:
+        with self._db() as connection:
+            now = time.time()
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE job_urls SET firecrawl_next_url=?,firecrawl_page_offset=?,pages_processed=pages_processed+?,last_error=NULL WHERE job_id=? AND url=?",
+                (next_url, max(0, int(page_offset)), int(page_completed), job_id, url),
+            )
+            connection.execute("UPDATE jobs SET updated_at=? WHERE job_id=?", (now, job_id))
+            connection.execute("UPDATE job_batches SET last_checkpoint_at=? WHERE job_id=? AND batch_number=(SELECT batch_number FROM job_urls WHERE job_id=? AND url=?)",
+                                (now, job_id, job_id, url))
+            connection.execute("COMMIT")
+
+    def auto_record_number(self, job_id: str, candidate_url: str, record: dict) -> bool:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            job = connection.execute("SELECT state_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            url_row = connection.execute("SELECT batch_number FROM job_urls WHERE job_id=? AND url=?", (job_id, candidate_url)).fetchone()
+            if job is None or url_row is None:
+                raise KeyError(job_id if job is None else candidate_url)
+            state = json.loads(job["state_json"])
+            number = str(record["number"])
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO job_results(
+                    job_id,number,candidate_url,source_url,website_url,page_title,page_description,batch_number,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (job_id, number, candidate_url, str(record.get("source_url", candidate_url)),
+                 str(record.get("website_url", "")), str(record.get("page_title", "")),
+                 str(record.get("page_description", "")), int(url_row["batch_number"] or 0), time.time()),
+            )
+            inserted = cursor.rowcount == 1
+            if inserted:
+                state["result_count"] = int(state.get("result_count", 0)) + 1
+                state["last_checkpoint_at"] = time.time()
+                connection.execute("UPDATE job_urls SET results_extracted=results_extracted+1 WHERE job_id=? AND url=?",
+                                   (job_id, candidate_url))
+                connection.execute("UPDATE jobs SET state_json=?,updated_at=? WHERE job_id=?", (self._json(state), time.time(), job_id))
+                self._append_event(connection, job_id, "number_found", {
+                    "result": {key: str(record.get(key, "")) for key in
+                               ("number", "source_url", "website_url", "page_title", "page_description")},
+                    "candidate_url": candidate_url, "batch_number": url_row["batch_number"],
+                    "successful_results": state["result_count"],
+                })
+            connection.commit()
+            return inserted
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def auto_retry_url(self, job_id: str, url: str, error: str, retry_at: float, diagnostics: dict | None = None) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE job_urls SET status='pending',last_error=?,retry_at=? WHERE job_id=? AND url=?",
+                (error[:500], retry_at, job_id, url),
+            )
+            row = connection.execute("SELECT state_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            state = json.loads(row["state_json"])
+            state["retry_at"] = retry_at
+            state["retry_stage"] = "crawling"
+            state["last_error"] = error[:500]
+            state["last_checkpoint_at"] = time.time()
+            connection.execute("UPDATE jobs SET state_json=?,updated_at=? WHERE job_id=?", (self._json(state), time.time(), job_id))
+            connection.execute("UPDATE job_batches SET retry_at=?,last_error=?,last_checkpoint_at=? WHERE job_id=? AND batch_number=?",
+                               (retry_at, error[:500], time.time(), job_id, int(state.get("batch_number", 0))))
+            self._append_event(connection, job_id, "warning", {"stage": "crawling", "candidate_url": url,
+                "message": error[:500], "retry_at": retry_at, "diagnostics": diagnostics or {}})
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def auto_complete_url(self, job_id: str, url: str, error: str | None = None,
+                          *, permanent_failure: bool = False) -> dict:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT status,state_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            url_row = connection.execute("SELECT * FROM job_urls WHERE job_id=? AND url=?", (job_id, url)).fetchone()
+            if row is None or url_row is None:
+                raise KeyError(job_id if row is None else url)
+            state = json.loads(row["state_json"])
+            batch_no = int(url_row["batch_number"] or 0)
+            status = "failed" if permanent_failure else "completed"
+            now = time.time()
+            connection.execute(
+                "UPDATE job_urls SET status=?,last_error=?,retry_at=NULL,completed_at=?,firecrawl_job_id=NULL,firecrawl_next_url=NULL,firecrawl_page_offset=0 WHERE job_id=? AND url=?",
+                (status, error[:500] if error else None, now, job_id, url),
+            )
+            state["current_url"] = None
+            state["processed_page_count"] = int(state.get("processed_page_count", 0)) + 1
+            if not permanent_failure:
+                state["successful_page_count"] = int(state.get("successful_page_count", 0)) + 1
+            state.pop("retry_at", None)
+            state.pop("retry_stage", None)
+            state["last_checkpoint_at"] = now
+            compat_id = uuid.uuid4().hex
+            connection.execute("UPDATE job_urls SET compat_decision_id=? WHERE job_id=? AND url=?", (compat_id, job_id, url))
+            connection.execute(
+                "INSERT INTO job_compat_decisions(job_id,decision_id,candidate_url,created_at) VALUES(?,?,?,?)",
+                (job_id, compat_id, url, now),
+            )
+            results = [dict(item) for item in connection.execute(
+                "SELECT number,source_url,website_url,page_title,page_description FROM job_results WHERE job_id=? AND candidate_url=? ORDER BY created_at,number",
+                (job_id, url),
+            ).fetchall()]
+            connection.execute(
+                "UPDATE job_batches SET urls_processed=urls_processed+1,urls_failed=urls_failed+?,current_position=?,last_checkpoint_at=? WHERE job_id=? AND batch_number=?",
+                (int(permanent_failure), int(url_row["position"] or 0), now, job_id, batch_no),
+            )
+            connection.execute("UPDATE jobs SET state_json=?,updated_at=? WHERE job_id=?", (self._json(state), now, job_id))
+            if error:
+                self._append_event(connection, job_id, "warning", {"stage": "crawling", "candidate_url": url, "message": error[:500]})
+            if results:
+                self._append_event(connection, job_id, "url_results_found", {
+                    "candidate_url": url, "results": results, "new_results_count": len(results),
+                    "successful_results": int(state.get("result_count", 0)), "mode": "automatic",
+                })
+            self._append_event(connection, job_id, "url_completed", {
+                "candidate_url": url, "results": results, "new_results_count": len(results), "error": error,
+                "decision_id": compat_id, "decision_url": f"/v1/jobs/{job_id}/decisions/{compat_id}",
+                "batch_number": batch_no,
+            })
+            self._append_event(connection, job_id, "page_completed", {
+                "page_url": url, "website_url": url_row["website_url"], "status": status,
+                "new_results_count": len(results), "processed_page_count": int(state.get("processed_page_count", 0)),
+                "successful_results": int(state.get("result_count", 0)), "error": error,
+            })
+            remaining = int(connection.execute(
+                "SELECT COUNT(*) FROM job_urls WHERE job_id=? AND batch_number=? AND status IN ('queued','pending','processing')",
+                (job_id, batch_no),
+            ).fetchone()[0])
+            batch = connection.execute("SELECT * FROM job_batches WHERE job_id=? AND batch_number=?", (job_id, batch_no)).fetchone()
+            batch_completed = remaining == 0
+            if batch_completed:
+                connection.execute("UPDATE job_batches SET status='completed',phase='completed',completed_at=?,last_checkpoint_at=? WHERE job_id=? AND batch_number=?",
+                                   (now, now, job_id, batch_no))
+                state.update({"current_stage": "searching", "current_phase": "search", "last_checkpoint_at": now})
+                connection.execute("UPDATE jobs SET state_json=? WHERE job_id=?", (self._json(state), job_id))
+                self._append_event(connection, job_id, "batch_completed", {
+                    "batch_number": batch_no, "urls_collected": batch["urls_collected"],
+                    "urls_processed": batch["urls_processed"] + 1, "urls_failed": batch["urls_failed"] + int(permanent_failure),
+                    "result_count": int(state.get("result_count", 0)),
+                })
+            connection.commit()
+            return {"results": results, "batch_completed": batch_completed, "status": status, "decision_id": compat_id}
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def auto_pause_memory(self, job_id: str, reason: str, snapshot: dict) -> bool:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT status,state_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None or row["status"] in TERMINAL:
+                connection.commit()
+                return False
+            state = json.loads(row["state_json"])
+            if state.get("current_stage") == "paused_memory":
+                connection.commit()
+                return False
+            prior = state.get("current_stage", "searching")
+            state["resume_stage"] = prior
+            state["current_stage"] = "paused_memory"
+            state["memory_pause"] = {"reason": reason[:500], "snapshot": snapshot, "paused_at": time.time()}
+            state["last_checkpoint_at"] = time.time()
+            connection.execute("UPDATE jobs SET state_json=?,updated_at=? WHERE job_id=?", (self._json(state), time.time(), job_id))
+            connection.execute("UPDATE job_batches SET phase='paused_memory',last_checkpoint_at=? WHERE job_id=? AND batch_number=? AND status IN ('collecting','ready','crawling')",
+                               (time.time(), job_id, int(state.get("batch_number", 0))))
+            self._append_event(connection, job_id, "memory_paused", {
+                "batch_number": state.get("batch_number"), "resume_stage": prior, "reason": reason[:500], "memory": snapshot,
+            })
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def auto_resume_memory(self, job_id: str, snapshot: dict) -> bool:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT state_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                connection.commit()
+                return False
+            state = json.loads(row["state_json"])
+            if state.get("current_stage") != "paused_memory" or state.get("stop_requested"):
+                connection.commit()
+                return False
+            now = time.time()
+            stage = state.pop("resume_stage", "searching")
+            state["current_stage"] = stage
+            state["memory_pause"] = None
+            state["last_checkpoint_at"] = now
+            connection.execute("UPDATE jobs SET state_json=?,updated_at=? WHERE job_id=?", (self._json(state), now, job_id))
+            batch_no = int(state.get("batch_number", 0))
+            batch_phase = "crawl" if stage in {"crawling", "batch_ready"} else "search"
+            connection.execute("UPDATE job_batches SET phase=?,last_checkpoint_at=? WHERE job_id=? AND batch_number=? AND status IN ('collecting','ready','crawling')",
+                               (batch_phase, now, job_id, batch_no))
+            self._append_event(connection, job_id, "memory_resumed", {"batch_number": batch_no, "stage": stage, "memory": snapshot})
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def auto_finish(self, job_id: str, status: str, reason: str) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT state_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            state = json.loads(row["state_json"])
+            now = time.time()
+            state.update({"status": status, "current_stage": status, "current_phase": status,
+                          "completion_reason": reason, "last_checkpoint_at": now})
+            active = connection.execute("SELECT url,batch_number FROM job_urls WHERE job_id=? AND status='processing'", (job_id,)).fetchall()
+            for item in active:
+                connection.execute("UPDATE job_urls SET status='interrupted',last_error=?,retry_at=NULL WHERE job_id=? AND url=?",
+                                   (reason, job_id, item["url"]))
+            connection.execute("UPDATE jobs SET status=?,state_json=?,updated_at=?,expires_at=? WHERE job_id=?",
+                               (status, self._json(state), now, now + self.retention_seconds, job_id))
+            event_name = {"completed": "job_completed", "failed": "job_failed", "stopped": "job_stopped"}[status]
+            self._append_event(connection, job_id, event_name, {
+                "job_id": job_id, "status": status, "reason": reason,
+                "successful_results": int(state.get("result_count", 0)),
+                "search_diagnostics": self._auto_search_summary(state),
+            })
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def auto_stop_requested(self, job_id: str) -> bool:
+        with self._db() as connection:
+            row = connection.execute("SELECT state_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+        return bool(row and json.loads(row["state_json"]).get("stop_requested"))
+
+    def auto_compat_decision(self, job_id: str, decision_id: str, decision: bool) -> dict:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT status,state_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            state = json.loads(row["state_json"])
+            prior = connection.execute(
+                "SELECT decision_value,candidate_url FROM job_compat_decisions WHERE job_id=? AND decision_id=?",
+                (job_id, decision_id),
+            ).fetchone()
+            if prior is None:
+                raise DecisionConflict("decision_id is unknown or belongs to a different job")
+            if prior["decision_value"] is not None:
+                if bool(prior["decision_value"]) is not decision:
+                    raise DecisionConflict("A different decision was already recorded for this decision_id")
+                connection.commit()
+                return {"job_id": job_id, "decision_id": decision_id, "decision": decision,
+                        "status": row["status"], "idempotent": True}
+            if row["status"] in TERMINAL:
+                connection.commit()
+                return {"job_id": job_id, "decision_id": decision_id, "decision": decision,
+                        "status": row["status"], "idempotent": True, "compatibility_noop": bool(decision)}
+            state["last_checkpoint_at"] = time.time()
+            connection.execute("UPDATE job_compat_decisions SET decision_value=? WHERE job_id=? AND decision_id=?",
+                               (int(decision), job_id, decision_id))
+            if not decision:
+                state["stop_requested"] = True
+                connection.execute("UPDATE jobs SET state_json=?,updated_at=? WHERE job_id=?",
+                                   (self._json(state), time.time(), job_id))
+                self._append_event(connection, job_id, "job_stop_requested", {
+                    "status": row["status"], "reason": "legacy_boolean_false", "candidate_url": prior["candidate_url"],
+                })
+            else:
+                connection.execute("UPDATE jobs SET state_json=?,updated_at=? WHERE job_id=?",
+                                   (self._json(state), time.time(), job_id))
+                self._append_event(connection, job_id, "decision_received", {
+                    "decision_id": decision_id, "decision": True, "compatibility_noop": True,
+                })
+            connection.commit()
+            return {"job_id": job_id, "decision_id": decision_id, "decision": decision,
+                    "status": row["status"], "idempotent": False, "compatibility_noop": decision}
         except Exception:
             connection.rollback()
             raise

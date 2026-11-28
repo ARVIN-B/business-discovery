@@ -34,15 +34,22 @@ Idempotency-Key: <کلید ثابت برای همان Job محلی>
 {"keyword":"موبایل","province":"اصفهان","count":null}
 ```
 
-برای جست‌وجوی کشوری مقدار `province` برابر `ایران` است. `count: null` یعنی Business Discovery نباید تعداد شماره‌های هدف Info Extractor را به‌عنوان سقف URL یا Crawl در نظر بگیرد؛ Info مالک هدف یکتای مشترک بین منابع است و تصمیم ادامه را بعد از هر URL می‌فرستد. در retryهای ایجاد Job، همان `Idempotency-Key` را نگه دارید.
+برای جست‌وجوی کشوری مقدار `province` برابر `ایران` است. `count: null` یعنی Business Discovery نباید تعداد شماره‌های هدف Info Extractor را به‌عنوان سقف URL یا Crawl در نظر بگیرد؛ Info مالک هدف یکتای مشترک بین منابع است و فقط هنگام لغو باید stop بفرستد. در retryهای ایجاد Job، همان `Idempotency-Key` را نگه دارید.
 
 پاسخ ایجاد Job شامل `job_id` و آدرس‌های `events_url`، `status_url`، `result_url` و `stop_url` است. پاسخ‌ها باید از همان origin تنظیم‌شده باشند. تمام endpointهای `/v1` نیاز به Bearer token دارند.
 
-## جریان رویداد و تصمیم ادامه
+## جریان رویداد و لغو
 
 رویدادها را از `events_url` با `Accept: text/event-stream` بخوانید. پس از reconnect، `Last-Event-ID` آخرین رویدادِ پذیرفته‌شده را بفرستید. `url_completed` برای هر URL می‌آید، از جمله URL بدون شماره یا Crawl ناموفق. شماره‌های جدید را از `data.results` بخوانید، در دیتابیس Info ذخیره کنید و تعداد یکتای کلی را دوباره محاسبه کنید.
 
-بعد از هر `url_completed` یک JSON Boolean خام به `decision_url` رویداد بفرستید:
+در نسخهٔ جدید Business Discovery نیازی به ارسال تصمیم برای ادامه نیست؛ بعد از هر `url_completed` خودش URL بعدی را پردازش می‌کند. اگر کاربر Job را لغو کرد، این درخواست را بفرستید:
+
+```http
+POST /v1/jobs/<job_id>/stop
+Authorization: Bearer <API_KEY>
+```
+
+مسیر Boolean برای سازگاری موقت با workerهای قدیمی نگه داشته شده است. `true` no-op است و `false` درخواست توقف می‌دهد:
 
 ```http
 POST /v1/jobs/<job_id>/decisions/<decision_id>
@@ -50,9 +57,9 @@ Authorization: Bearer <API_KEY>
 Content-Type: application/json
 ```
 
-بدنه باید دقیقاً `true` یا `false` باشد؛ شیئی مثل `{"continue":true}` معتبر نیست. تا وقتی Job محلی لغو نشده و هدف یکتای مشترک Info کامل نشده `true` بفرستید. پس از رسیدن هدف یا لغو صریح، `false` بفرستید. همان decision ID و همان Boolean را در retry تکرار کنید؛ cursor SSE را تا پذیرفته‌شدن تصمیم جلو نبرید.
+بدنه باید دقیقاً `true` یا `false` باشد؛ شیئی مثل `{"continue":true}` معتبر نیست. این مسیر deprecated است؛ در نسخه‌های جدید فقط هنگام لغو صریح، stop endpoint را صدا بزنید. همان decision ID و Boolean را در retry درخواست قدیمی تکرار کنید؛ cursor SSE را پس از ذخیرهٔ رویداد در Info جلو ببرید.
 
-Info Extractor در نسخهٔ بررسی‌شدهٔ این قرارداد، `keyword`، `province` و `count: null` را می‌فرستد و برای `url_completed` تصمیم Boolean می‌دهد. بنابراین برای رفع `search_exhausted` نیازی به تغییر پروتکل اتصال Info نیست.
+Info Extractor می‌تواند همچنان `keyword`، `province` و `count: null` بفرستد. برای نسخهٔ جدید توصیه می‌شود Boolean تصمیم را حذف و لغو را به stop endpoint وصل کند. چون `true` دیگر لازم نیست، انتظار برای پاسخ تصمیم نباید بین رویدادهای SSE قرار بگیرد.
 
 ## بررسی نتیجهٔ بدون URL
 

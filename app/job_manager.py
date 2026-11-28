@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
 
 from .job_store import IdempotencyConflict, JobStore, TERMINAL
+from .memory_guard import MemoryGuard
 
 log = logging.getLogger("business_discovery.jobs")
 
@@ -36,20 +37,28 @@ class JobManager:
         search_batch_size: int = 1000,
         search_retry_seconds: int = 60,
         search_queries_fn: Callable[[str, str], list[str]] | None = None,
+        process_incremental_fn: Callable[..., Awaitable[dict]] | None = None,
+        memory_guard: MemoryGuard | None = None,
+        memory_check_interval: int = 15,
+        automatic_jobs: bool = True,
     ):
         self.store = store
         self.search_fn = search_fn
         self.query_fn = query_fn
         self.process_fn = process_fn
         self.normalize_phone_fn = normalize_phone_fn
-        self.max_concurrent_sites = max_concurrent_sites
+        self.max_concurrent_sites = 1
         self.max_rounds = max_rounds
         self.url_factor = url_factor
         self.max_search_pages = max_search_pages
         self.cleanup_interval = cleanup_interval
-        self.search_batch_size = max(1, search_batch_size)
+        self.search_batch_size = max(1, min(100, search_batch_size))
         self.search_retry_seconds = max(1, search_retry_seconds)
         self.search_queries_fn = search_queries_fn
+        self.process_incremental_fn = process_incremental_fn
+        self.memory_guard = memory_guard or MemoryGuard()
+        self.memory_check_interval = max(1, int(memory_check_interval))
+        self.automatic_jobs = bool(automatic_jobs)
         self.tasks: dict[str, asyncio.Task] = {}
         self.decision_events: dict[str, asyncio.Event] = {}
         self.cleanup_task: asyncio.Task | None = None
@@ -133,13 +142,13 @@ class JobManager:
         job_id = uuid.uuid4().hex
         state = {
             "schema_version": 2,
-            "job_model_version": 4,
+            "job_model_version": 5 if self.automatic_jobs else 4,
             "job_id": job_id,
             "status": "queued",
             "keyword": keyword,
             "province": province,
             "requested_count": count,
-            "mode": "approval_controlled",
+            "mode": "automatic" if self.automatic_jobs else "approval_controlled",
             "stop_requested": False,
             "active_urls": [],
             "search_batch_size": self.search_batch_size,
@@ -182,6 +191,17 @@ class JobManager:
             "stop_after_round": False,
             "fail_after_round": False,
         }
+        if self.automatic_jobs:
+            state.update({
+                "schema_version": 3, "job_model_version": 5, "current_stage": "searching",
+                "current_phase": "search", "search_batch_size": self.search_batch_size,
+                "batch_number": 0, "query_index": 0, "query_states": {}, "search_exhausted": False,
+                "result_count": 0, "last_checkpoint_at": time.time(), "memory_pause": None,
+            })
+            for key in ("batch_urls", "batch_index", "url_queue", "seen_urls", "page_statuses", "results",
+                        "processed_urls", "registered_numbers", "decisions", "pagination", "round_pages",
+                        "provider_failure_queries", "active_urls", "active_url", "pending_decision_id"):
+                state.pop(key, None)
         request_hash = hashlib.sha256(
             json.dumps({"keyword": keyword, "province": province, "count": count}, ensure_ascii=False, sort_keys=True).encode()
         ).hexdigest()
@@ -192,6 +212,37 @@ class JobManager:
         return self._public_state(record), created
 
     def _public_state(self, record: dict) -> dict:
+        if int(record["state"].get("job_model_version", 3)) >= 5:
+            snapshot = self.store.auto_snapshot(record["job_id"])
+            if snapshot:
+                state = snapshot["state"]
+                batch = snapshot.get("batch") or {}
+                current_url = snapshot.get("current_url")
+                return {
+                    "schema_version": 3, "job_id": record["job_id"], "status": record["status"],
+                    "created_at": record["created_at"], "updated_at": record["updated_at"],
+                    "last_event_id": record["last_event_id"], "requested_count": state.get("requested_count"),
+                    "mode": "automatic", "stop_requested": bool(state.get("stop_requested")),
+                    "current_stage": state.get("current_stage"), "current_phase": state.get("current_phase"),
+                    "batch_number": state.get("batch_number", 0), "batch_size": state.get("search_batch_size"),
+                    "batch_url_count": batch.get("urls_collected", 0), "batch_processed_count": batch.get("urls_processed", 0),
+                    "batch_failed_count": batch.get("urls_failed", 0),
+                    "queued_url_count": snapshot.get("queued_url_count", 0),
+                    "discovered_page_count": snapshot.get("total_url_count", 0),
+                    "processed_page_count": snapshot.get("completed_url_count", 0) + snapshot.get("failed_url_count", 0),
+                    "successful_page_count": snapshot.get("completed_url_count", 0),
+                    "successful_results": int(state.get("result_count", 0)),
+                    "total_unique_mobile_numbers": int(state.get("result_count", 0)),
+                    "current_query": snapshot.get("current_query"), "active_url": current_url,
+                    "current_query_index": state.get("query_index", 0),
+                    "next_search_page": state.get("query_states", {}).get(snapshot.get("current_query"), {}).get("next_page", 1),
+                    "failed_url_count": snapshot.get("failed_url_count", 0),
+                    "last_checkpoint_at": state.get("last_checkpoint_at"), "retry_at": state.get("retry_at", state.get("search_retry_at")),
+                    "memory_pause": state.get("memory_pause"), "search_exhausted": state.get("search_exhausted", False),
+                    "reason": state.get("completion_reason"), "search_diagnostics": self.store._auto_search_summary(state),
+                    "results": snapshot.get("results", []), "errors": state.get("errors", []),
+                    "warnings": state.get("warnings", []),
+                }
         state = record["state"]
         search_diagnostics = self._search_diagnostics(state)
         return {
@@ -247,6 +298,13 @@ class JobManager:
         status = self.status(job_id)
         if status is None:
             return None
+        if status.get("schema_version", 2) >= 3:
+            return {key: status.get(key) for key in (
+                "schema_version", "job_id", "status", "requested_count", "mode", "stop_requested",
+                "batch_number", "batch_size", "reason", "search_diagnostics", "successful_results",
+                "total_unique_mobile_numbers", "discovered_page_count", "processed_page_count",
+                "successful_page_count", "results", "errors", "warnings", "last_checkpoint_at",
+            )}
         return {
             "schema_version": 2,
             "job_id": status["job_id"],
@@ -272,10 +330,197 @@ class JobManager:
 
     async def _run(self, job_id: str) -> None:
         record = self.store.get(job_id)
-        if record and int(record["state"].get("job_model_version", 3)) >= 4:
+        if record and int(record["state"].get("job_model_version", 3)) >= 5:
+            await self._run_auto_job(job_id)
+        elif record and int(record["state"].get("job_model_version", 3)) >= 4:
             await self._run_approval_job(job_id)
         else:
             await self._run_legacy(job_id)
+
+    async def _memory_wait(self, job_id: str) -> bool:
+        """Pause durably under memory pressure; return True when stop/shutdown is requested."""
+        snapshot = self.memory_guard.snapshot()
+        if not snapshot.under_pressure:
+            current = self.store.get(job_id)
+            if current and current["state"].get("current_stage") == "paused_memory":
+                self.store.auto_resume_memory(job_id, snapshot.as_dict())
+            return self.store.auto_stop_requested(job_id)
+        self.store.auto_pause_memory(job_id, snapshot.reason or "memory pressure", snapshot.as_dict())
+        while not self.stopping and not self.store.auto_stop_requested(job_id):
+            event = self.decision_events.setdefault(job_id, asyncio.Event())
+            event.clear()
+            if self.store.auto_stop_requested(job_id) or self.stopping:
+                break
+            try:
+                await asyncio.wait_for(event.wait(), timeout=self.memory_check_interval)
+            except asyncio.TimeoutError:
+                pass
+            snapshot = self.memory_guard.snapshot()
+            if not snapshot.under_pressure:
+                self.store.auto_resume_memory(job_id, snapshot.as_dict())
+                return False
+        return True
+
+    async def _wait_or_stop(self, job_id: str, seconds: float) -> bool:
+        """Wait for a retry deadline, but wake promptly for stop or service shutdown."""
+        if self.store.auto_stop_requested(job_id) or self.stopping:
+            return True
+        event = self.decision_events.setdefault(job_id, asyncio.Event())
+        event.clear()
+        if self.store.auto_stop_requested(job_id) or self.stopping:
+            return True
+        try:
+            await asyncio.wait_for(event.wait(), timeout=max(0.0, seconds))
+        except asyncio.TimeoutError:
+            pass
+        return self.store.auto_stop_requested(job_id) or self.stopping
+
+    async def _run_auto_job(self, job_id: str) -> None:
+        try:
+            if not self.store.claim(job_id):
+                return
+            while not self.stopping:
+                snap = self.store.auto_snapshot(job_id, include_results=False)
+                if not snap or snap["status"] in TERMINAL:
+                    return
+                state = snap["state"]
+                if state.get("stop_requested"):
+                    self.store.auto_finish(job_id, "stopped", "stop_requested")
+                    return
+                if await self._memory_wait(job_id):
+                    self.store.auto_finish(job_id, "stopped", "stop_requested")
+                    return
+                batch = self.store.auto_active_batch(job_id)
+                if batch and batch["status"] in {"ready", "crawling"}:
+                    candidate = self.store.auto_start_url(job_id)
+                    if candidate:
+                        if self.process_incremental_fn:
+                            async with self.site_semaphore:
+                                result = await self.process_incremental_fn(
+                                    candidate, job_id, self.store, self.memory_guard,
+                                    lambda: self.store.auto_stop_requested(job_id),
+                                )
+                        else:
+                            result = await self.process_fn(candidate, self.site_semaphore)
+                            for record in self._records_for_url(candidate, result):
+                                self.store.auto_record_number(job_id, candidate["url"], record)
+                        if result.get("paused_memory"):
+                            await self._memory_wait(job_id)
+                            continue
+                        if result.get("stopped") or self.store.auto_stop_requested(job_id):
+                            self.store.auto_finish(job_id, "stopped", "stop_requested")
+                            return
+                        error = str(result.get("error"))[:500] if result.get("error") else None
+                        if result.get("retry_at"):
+                            self.store.auto_retry_url(job_id, candidate["url"], error or "transient crawl failure",
+                                                     float(result["retry_at"]), result.get("diagnostics"))
+                            await self._wait_or_stop(job_id, max(0.1, float(result["retry_at"]) - time.time()))
+                            continue
+                        self.store.auto_complete_url(job_id, candidate["url"], error,
+                                                     permanent_failure=bool(result.get("permanent_failure")))
+                        continue
+                    # Empty or fully done batch: seal a short final batch, or start another page search.
+                    if self.store.auto_search_complete(job_id):
+                        if self.store.auto_has_pending_urls(job_id):
+                            self.store.auto_begin_batch(job_id)
+                            continue
+                        self.store.auto_finish(job_id, "completed", "search_exhausted")
+                        return
+                    retry_at = batch.get("retry_at")
+                    if retry_at and float(retry_at) > time.time():
+                        await self._wait_or_stop(job_id, float(retry_at) - time.time())
+                        continue
+                    self.store.auto_seal_batch(job_id)
+                    continue
+                if batch and batch["status"] == "collecting" and self.store.auto_search_complete(job_id):
+                    if int(batch.get("urls_collected", 0)) > 0:
+                        self.store.auto_seal_batch(job_id)
+                        continue
+                    self.store.auto_finish(job_id, "completed", "search_exhausted")
+                    return
+                if not batch:
+                    batch = self.store.auto_begin_batch(job_id)
+                    if batch and batch["status"] in {"ready", "crawling"}:
+                        continue
+                await self._auto_search_one_page(job_id)
+                await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("Automatic discovery job %s failed", job_id)
+            current = self.store.get(job_id)
+            if current and current["status"] not in TERMINAL:
+                self.store.auto_finish(job_id, "failed", str(exc)[:500])
+
+    async def _auto_search_one_page(self, job_id: str) -> None:
+        snap = self.store.auto_snapshot(job_id)
+        if not snap:
+            return
+        state = snap["state"]
+        queries = state.get("search_queries", [])
+        idx = int(state.get("query_index", 0))
+        if idx >= len(queries):
+            self.store.auto_mark_search_exhausted(job_id)
+            return
+        query = queries[idx]
+        cursor = state.get("query_states", {}).get(query, {})
+        retry_at = state.get("search_retry_at")
+        if retry_at and float(retry_at) > time.time():
+            await self._wait_or_stop(job_id, min(self.memory_check_interval, float(retry_at) - time.time()))
+            return
+        query_state = cursor or {"next_page": 1}
+
+        async def checkpoint(next_page: int, candidates: list[dict], exhausted: bool, diagnostics: dict | None = None):
+            if self.store.auto_stop_requested(job_id) or self.stopping:
+                return False
+            # Filter through SQLite so duplicates across 1000s of search results are never retained in RAM.
+            fingerprint = (diagnostics or {}).get("result_fingerprint")
+            prior_fingerprint = query_state.get("last_fingerprint")
+            if fingerprint and fingerprint == prior_fingerprint:
+                exhausted = True
+                diagnostics = {**(diagnostics or {}), "repeated_page": True}
+            if fingerprint:
+                query_state["last_fingerprint"] = fingerprint
+            fresh = [item for item in candidates if not self.store.auto_url_exists(job_id, str(item.get("url", "")))]
+            self.store.auto_record_search_page(job_id, query, next_page, fresh, exhausted, diagnostics)
+            memory = self.memory_guard.snapshot()
+            if memory.under_pressure:
+                self.store.auto_pause_memory(job_id, memory.reason or "memory pressure", memory.as_dict())
+                return False
+            # One SearXNG response is the checkpoint unit; never retain a long result list.
+            return False
+
+        try:
+            await self.search_fn(state["keyword"], state["province"], None,
+                excluded_urls=set(), round_number=idx + 1,
+                start_page=int(query_state.get("next_page", 1)), initial_sites=[], page_callback=checkpoint,
+                max_pages=0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            retry_after = getattr(exc, "retry_after", None)
+            delay = max(1, float(retry_after if retry_after is not None else self.search_retry_seconds))
+            next_query_index = None
+            failed_cycle = None
+            diagnostics = getattr(exc, "diagnostics", {}) or {}
+            if diagnostics.get("provider_failure"):
+                failures = list(state.get("provider_failure_queries", []))
+                if query not in failures:
+                    failures.append(query)
+                untried = [index for index, item in enumerate(queries)
+                           if item not in failures and not state.get("query_states", {}).get(item, {}).get("exhausted")]
+                if untried and getattr(exc, "retry_after", None) is None:
+                    next_query_index = untried[0]
+                    failed_cycle = failures
+                    delay = min(delay, 0.25)
+                else:
+                    remaining = [index for index, item in enumerate(queries)
+                                 if index > idx and not state.get("query_states", {}).get(item, {}).get("exhausted")]
+                    next_query_index = remaining[0] if remaining else idx
+                    failed_cycle = []
+            self.store.auto_search_retry(job_id, query, str(exc), time.time() + delay,
+                getattr(exc, "http_status", None), diagnostics, next_query_index, failed_cycle)
+            await self._wait_or_stop(job_id, min(delay, 10))
 
     async def _run_approval_job(self, job_id: str) -> None:
         try:
@@ -521,7 +766,11 @@ class JobManager:
         }
 
     def decide(self, job_id: str, decision_id: str, decision: bool) -> dict:
-        result = self.store.resolve_decision(job_id, decision_id, decision)
+        record = self.store.get(job_id)
+        if record and int(record["state"].get("job_model_version", 3)) >= 5:
+            result = self.store.auto_compat_decision(job_id, decision_id, decision)
+        else:
+            result = self.store.resolve_decision(job_id, decision_id, decision)
         self.decision_events.setdefault(job_id, asyncio.Event()).set()
         return result
 

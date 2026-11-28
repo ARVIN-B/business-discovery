@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import hashlib
 import ipaddress
 import json
 import logging
@@ -20,6 +21,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from .job_manager import IdempotencyConflict, JobManager
+from .memory_guard import MemoryGuard
 from .job_store import DecisionConflict, JobStore, TERMINAL
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -30,13 +32,16 @@ FIRECRAWL_URL = os.getenv("FIRECRAWL_URL", "http://127.0.0.1:3002")
 API_KEY = os.getenv("API_KEY", "")
 SEARCH_TIMEOUT = float(os.getenv("SEARCH_TIMEOUT", "20"))
 CRAWL_TIMEOUT = float(os.getenv("CRAWL_TIMEOUT", "240"))
-MAX_CRAWL_PAGES = int(os.getenv("MAX_CRAWL_PAGES", "10"))
-MAX_CRAWL_DEPTH = int(os.getenv("MAX_CRAWL_DEPTH", "2"))
-MAX_CONCURRENT_SITES = int(os.getenv("MAX_CONCURRENT_SITES", "3"))
+MAX_CRAWL_PAGES = min(50, max(1, int(os.getenv("MAX_CRAWL_PAGES", "10"))))
+MAX_CRAWL_DEPTH = min(5, max(0, int(os.getenv("MAX_CRAWL_DEPTH", "2"))))
+MAX_CONCURRENT_SITES = 1
 SEARCH_URL_FACTOR = 1.6
 MAX_SEARCH_ROUNDS = 3  # Retained only by the legacy synchronous helper.
-SEARCH_BATCH_SIZE = max(1, int(os.getenv("SEARCH_BATCH_SIZE", "1000")))
+SEARCH_BATCH_SIZE = min(100, max(1, int(os.getenv("SEARCH_BATCH_SIZE", "100"))))
 SEARCH_RETRY_SECONDS = max(1, int(os.getenv("SEARCH_RETRY_SECONDS", "60")))
+HOST_MEMORY_BUDGET_MB = max(256, int(os.getenv("HOST_MEMORY_BUDGET_MB", "7168")))
+MEMORY_AVAILABLE_FLOOR_MB = max(128, int(os.getenv("MEMORY_AVAILABLE_FLOOR_MB", "1024")))
+MEMORY_CHECK_INTERVAL_SECONDS = max(1, int(os.getenv("MEMORY_CHECK_INTERVAL_SECONDS", "15")))
 MAX_SEARCH_PAGES = int(os.getenv("MAX_SEARCH_PAGES", "0"))
 SEARXNG_LANGUAGE = os.getenv("SEARXNG_LANGUAGE", "en-US")
 JOB_DB_PATH = os.getenv("JOB_DB_PATH", "/opt/business-discovery/data/jobs.sqlite3")
@@ -53,7 +58,7 @@ CONTACT_HINTS = ("contact", "about", "تماس", "درباره", "ارتباط")
 class DiscoverRequest(BaseModel):
     keyword: str = Field(min_length=1, max_length=120)
     province: str = Field(min_length=1, max_length=80, description="Province or location, e.g. اصفهان or ایران")
-    count: int | None = Field(default=None, ge=1, le=100, description="Unique mobile number target; omit or null for unlimited discovery")
+    count: int | None = Field(default=None, ge=1, description="Informational target supplied for caller compatibility; does not limit discovery")
 
     @field_validator("keyword", "province")
     @classmethod
@@ -83,6 +88,9 @@ async def lifespan(app: FastAPI):
         search_retry_seconds=SEARCH_RETRY_SECONDS,
         search_queries_fn=search_queries_for_job,
         cleanup_interval=JOB_CLEANUP_INTERVAL,
+        process_incremental_fn=process_site_incremental,
+        memory_guard=MemoryGuard(HOST_MEMORY_BUDGET_MB, MEMORY_AVAILABLE_FLOOR_MB),
+        memory_check_interval=MEMORY_CHECK_INTERVAL_SECONDS,
     )
     await manager.start()
     app.state.job_manager = manager
@@ -368,6 +376,7 @@ async def search_sites(
                 "duplicate_url_count": duplicate_count, "rejected_url_count": sum(rejected.values()),
                 "rejected_reasons": rejected, "unresponsive_engines": unresponsive[:10] if isinstance(unresponsive, list) else [],
                 "next_page": page_no + 1, "exhausted": exhausted, "repeated_page": repeated_page,
+                "result_fingerprint": hashlib.sha256("\n".join(fingerprint).encode()).hexdigest() if fingerprint else None,
             }
             if page_callback:
                 keep_searching = await page_callback(page_no + 1, new_sites, exhausted, diagnostics)
@@ -547,6 +556,112 @@ async def process_site(client: httpx.AsyncClient, site: dict, semaphore: asyncio
 async def process_site_in_background(site: dict, semaphore: asyncio.Semaphore) -> dict:
     async with httpx.AsyncClient(timeout=httpx.Timeout(60, connect=10), follow_redirects=False) as client:
         return await process_site(client, site, semaphore)
+
+
+async def process_site_incremental(site: dict, job_id: str, store: JobStore, memory_guard: MemoryGuard,
+                                   stop_requested) -> dict:
+    """Resume one Firecrawl crawl and checkpoint each page before dropping its payload."""
+    remote_id = site.get("firecrawl_job_id")
+    cursor = site.get("firecrawl_next_url")
+    page_offset = int(site.get("firecrawl_page_offset") or 0)
+    pages_seen = int(site.get("pages_processed") or 0)
+    deadline = time.monotonic() + CRAWL_TIMEOUT
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60, connect=10), follow_redirects=False) as client:
+        try:
+            if stop_requested():
+                return {"stopped": True}
+            if memory_guard.snapshot().under_pressure:
+                return {"paused_memory": True}
+            if not remote_id:
+                created = await client.post(
+                    f"{FIRECRAWL_URL.rstrip('/')}/v2/crawl",
+                    json={"url": site["url"], "limit": MAX_CRAWL_PAGES,
+                          "maxDiscoveryDepth": MAX_CRAWL_DEPTH,
+                          "scrapeOptions": {"formats": ["markdown", "rawHtml"], "onlyMainContent": False, "timeout": 45000}},
+                    timeout=45,
+                )
+                created.raise_for_status()
+                remote_id = created.json().get("id")
+                if not remote_id:
+                    return {"error": "Firecrawl did not return a crawl job id", "permanent_failure": True}
+                store.auto_set_firecrawl_job(job_id, site["url"], str(remote_id))
+
+            while time.monotonic() < deadline:
+                if stop_requested():
+                    await client.delete(f"{FIRECRAWL_URL.rstrip('/')}/v2/crawl/{remote_id}", timeout=10)
+                    return {"stopped": True}
+                if memory_guard.snapshot().under_pressure:
+                    return {"paused_memory": True}
+                endpoint = cursor or f"{FIRECRAWL_URL.rstrip('/')}/v2/crawl/{remote_id}"
+                if cursor:
+                    endpoint = urljoin(f"{FIRECRAWL_URL.rstrip('/')}/v2/crawl/{remote_id}", str(cursor))
+                    expected = urlsplit(FIRECRAWL_URL)
+                    actual = urlsplit(endpoint)
+                    if (actual.scheme, actual.hostname, actual.port) != (expected.scheme, expected.hostname, expected.port):
+                        return {"error": "Firecrawl pagination cursor changed origin", "permanent_failure": True}
+                response = await client.get(endpoint, timeout=30)
+                response.raise_for_status()
+                payload = response.json()
+                status = payload.get("status")
+                data = payload.get("data") or []
+                if not isinstance(data, list):
+                    return {"error": "Firecrawl returned an invalid data page", "permanent_failure": True}
+                offset = page_offset if cursor else page_offset
+                for index in range(offset, len(data)):
+                    page = data[index]
+                    if not isinstance(page, dict):
+                        store.auto_set_firecrawl_cursor(job_id, site["url"], cursor, index + 1)
+                        continue
+                    source = page_source(page, site["url"])
+                    if source and domain_of(source) == domain_of(site["url"]):
+                        content = "\n".join(str(page.get(key) or "") for key in ("markdown", "html", "rawHtml"))
+                        metadata = page.get("metadata") or {}
+                        title = str(metadata.get("title") or page.get("title") or "")[:500]
+                        description = str(metadata.get("description") or page.get("description") or "")[:2000]
+                        for number in extract_mobile_numbers(content):
+                            store.auto_record_number(job_id, site["url"], {
+                                "number": number, "source_url": source, "website_url": homepage_url(source),
+                                "page_title": title, "page_description": description,
+                            })
+                    store.auto_set_firecrawl_cursor(job_id, site["url"], cursor, index + 1)
+                    pages_seen += 1
+                    if stop_requested():
+                        await client.delete(f"{FIRECRAWL_URL.rstrip('/')}/v2/crawl/{remote_id}", timeout=10)
+                        return {"stopped": True}
+                    memory = memory_guard.snapshot()
+                    if memory.under_pressure:
+                        return {"paused_memory": True}
+                next_url = payload.get("next")
+                if next_url:
+                    # Persist a same-origin absolute cursor so restart continues safely.
+                    next_endpoint = urljoin(endpoint, str(next_url))
+                    expected = urlsplit(FIRECRAWL_URL)
+                    actual = urlsplit(next_endpoint)
+                    if (actual.scheme, actual.hostname, actual.port) != (expected.scheme, expected.hostname, expected.port):
+                        return {"error": "Firecrawl pagination cursor changed origin", "permanent_failure": True}
+                    store.auto_set_firecrawl_cursor(job_id, site["url"], next_endpoint, 0, page_completed=True)
+                    cursor, page_offset = next_endpoint, 0
+                    continue
+                if status == "completed" or (cursor is not None and not next_url):
+                    return {"pages_processed": pages_seen}
+                if status in {"failed", "cancelled"}:
+                    return {"error": f"Firecrawl job {status}", "permanent_failure": True}
+                # Persist current chunk offset before polling the remote job again.
+                page_offset = len(data)
+                store.auto_set_firecrawl_cursor(job_id, site["url"], None, page_offset)
+                await asyncio.sleep(3)
+            return {"error": "Firecrawl crawl timed out", "retry_at": time.time() + 60}
+        except asyncio.CancelledError:
+            # Keep the remote job alive across application restarts; its ID/cursor are durable.
+            raise
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            if status_code >= 500 or status_code == 429:
+                return {"error": f"Firecrawl HTTP {status_code}", "retry_at": time.time() + 60,
+                        "diagnostics": {"http_status": status_code}}
+            return {"error": f"Firecrawl HTTP {status_code}", "permanent_failure": True}
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            return {"error": f"Firecrawl request failed: {type(exc).__name__}", "retry_at": time.time() + 60}
 
 
 async def run_discovery(keyword: str, province: str, target_count: int, search_fn=None, process_fn=None) -> dict:

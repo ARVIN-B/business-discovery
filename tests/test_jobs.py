@@ -176,7 +176,7 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         self.manager = JobManager(
             self.store, search_fn=search, query_fn=lambda _keyword, _province, _index: "test query", process_fn=process,
             normalize_phone_fn=main.normalize_mobile, max_concurrent_sites=2,
-            search_batch_size=2, search_retry_seconds=1,
+            search_batch_size=2, search_retry_seconds=1, automatic_jobs=False,
         )
         await self.manager.start()
         self.auto_approve = True
@@ -389,7 +389,7 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["status"], "stopped")
         self.assertEqual(started, ["https://market.ir/listing/overshoot"])
 
-    async def test_restart_while_awaiting_approval_preserves_decision_id(self):
+    async def test_restart_migrates_awaiting_approval_and_accepts_delayed_decision(self):
         async def search(keyword, province, needed, excluded_urls, round_number, start_page, initial_sites, page_callback, max_pages):
             pages = [candidate("https://resume.ir/listing/1")]
             await page_callback(start_page + 1, pages, True)
@@ -406,13 +406,11 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         self.manager.store = reopened
         await self.manager.start()
         resumed = self.manager.status(job["job_id"])
-        self.assertEqual(resumed["current_stage"], "awaiting_approval")
-        self.assertEqual(resumed["pending_decision_id"], decision_id)
-        self.manager.search_fn = AsyncMock(side_effect=AssertionError("recovery must not search again"))
+        self.assertIn(resumed["current_stage"], {"searching", "batch_ready", "crawling", "completed"})
         self.manager.decide(job["job_id"], decision_id, True)
-        final = await self.wait_terminal(job["job_id"])
-        self.assertEqual(final["status"], "completed")
-        self.assertEqual(final["successful_results"], 1)
+        accepted = self.manager.decide(job["job_id"], decision_id, True)
+        self.assertEqual(accepted["decision"], True)
+        self.assertNotEqual(self.manager.status(job["job_id"])["current_stage"], "awaiting_approval")
 
     async def test_unlimited_mode_processes_multiple_rounds_without_numeric_target(self):
         async def search(keyword, province, needed, excluded_urls, round_number, start_page, initial_sites, page_callback, max_pages):
@@ -666,7 +664,7 @@ class SSEEndpointTests(unittest.IsolatedAsyncioTestCase):
         async def process(page, _semaphore):
             await asyncio.sleep(.02)
             return {"pages": [extracted_page(page["url"], ["09123456789"], "Listing title")]}
-        manager = JobManager(store, search, main.search_query_for_round, process, main.normalize_mobile, max_concurrent_sites=1)
+        manager = JobManager(store, search, main.search_query_for_round, process, main.normalize_mobile, max_concurrent_sites=1, automatic_jobs=False)
         await manager.start()
         main.app.state.job_manager = manager
         token = "test-token-that-is-long-enough-123456"
