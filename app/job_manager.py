@@ -618,7 +618,10 @@ class JobManager:
         query = state["round_query"]
         pagination = state["pagination"].get(query, {"next_page": 1, "exhausted": False})
         initial_pages = list(state["round_pages"])
-        if pagination.get("exhausted") or pagination.get("next_page", 1) > self.max_search_pages:
+        if pagination.get("exhausted") or (
+            self.max_search_pages > 0
+            and pagination.get("next_page", 1) > self.max_search_pages
+        ):
             state["current_stage"] = "processing"
             state["round_search_complete"] = True
             self._update_round_counts(state)
